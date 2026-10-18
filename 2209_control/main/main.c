@@ -46,11 +46,13 @@
 // Speed & Stepping Parameters (Potentiometer Demo)
 // -----------------------------------------------------------------------------
 #define STEP_PULSE_US          5               // 5 us pulse width (matches working script)
-#define POT_DEADBAND_LOW       80              // ADC counts <= this threshold stop the motors
+#define POT_DEADBAND_LOW       40              // Deadband count for solid zero
 #define MIN_RUN_SPEED_HZ       100             // 100 Hz starting step rate (matches working script)
 #define MAX_SPEED_HZ           12000           // 12000 Hz max step rate (matches working script)
-#define TIMER_BASE_INTERVAL_US 25              // 25 us base timer tick for smooth up to 12 kHz stepping
 
+static volatile int target_speed_hz  = MIN_RUN_SPEED_HZ;
+static volatile int current_speed_hz = 0;
+static volatile bool timer_running   = false;
 static esp_timer_handle_t step_timer = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 
@@ -82,12 +84,10 @@ static int read_pot_mapped(int *out_raw)
         *out_raw = adc_raw;
     }
 
-    // Low deadband: turning pot fully counter-clockwise stops all motors
     if (adc_raw <= POT_DEADBAND_LOW) {
         return 0;
     }
 
-    // Map [POT_DEADBAND_LOW .. 4095] smoothly to [MIN_RUN_SPEED_HZ .. MAX_SPEED_HZ]
     int mapped = MIN_RUN_SPEED_HZ + ((adc_raw - POT_DEADBAND_LOW) * (MAX_SPEED_HZ - MIN_RUN_SPEED_HZ)) / (4095 - POT_DEADBAND_LOW);
     if (mapped > MAX_SPEED_HZ) mapped = MAX_SPEED_HZ;
     return mapped;
@@ -114,56 +114,43 @@ static void uart_setup(void)
 }
 
 // -----------------------------------------------------------------------------
-// Multi-Motor Step Pulse Timer Callback
+// Step Pulse Timer Callback (Matching Verified Script)
 // -----------------------------------------------------------------------------
 static void step_timer_callback(void *arg)
 {
-    bool pulse[TMC_NUM_MOTORS] = {false};
-    bool any_pulse = false;
+    int speed = target_speed_hz;
+    if (speed <= 0) {
+        timer_running = false;
+        current_speed_hz = 0;
+        return;
+    }
 
+    // Simultaneously pulse all motor STEP pins (GPIO 9, 5, 7, 12)
+    gpio_set_level(GPIO_NUM_9, 1);
+    gpio_set_level(GPIO_NUM_5, 1);
+    gpio_set_level(GPIO_NUM_7, 1);
+    gpio_set_level(GPIO_NUM_12, 1);
+
+    esp_rom_delay_us(STEP_PULSE_US);
+
+    gpio_set_level(GPIO_NUM_9, 0);
+    gpio_set_level(GPIO_NUM_5, 0);
+    gpio_set_level(GPIO_NUM_7, 0);
+    gpio_set_level(GPIO_NUM_12, 0);
+
+    current_speed_hz = speed;
     for (int i = 0; i < TMC_NUM_MOTORS; i++) {
-        // Skip drivers that are not present, disabled, or controlled via UART VACTUAL
-        if (!motors[i].present || !motors[i].enabled || motors[i].is_stalled) {
-            continue;
-        }
-        if (motors[i].motion_mode == MOTION_MODE_UART_VACTUAL) {
-            continue;
-        }
-
-        int speed = motors[i].target_speed_hz;
-        if (speed <= 0) {
-            motors[i].current_speed_hz = 0;
-            continue;
-        }
-
-        motors[i].step_accum_us += TIMER_BASE_INTERVAL_US;
-        int32_t step_interval_us = 1000000 / speed;
-        if (step_interval_us < TIMER_BASE_INTERVAL_US) {
-            step_interval_us = TIMER_BASE_INTERVAL_US;
-        }
-
-        if (motors[i].step_accum_us >= step_interval_us) {
-            motors[i].step_accum_us -= step_interval_us;
-            pulse[i] = true;
-            any_pulse = true;
-            gpio_set_level(motors[i].step_pin, 1);
-            motors[i].current_speed_hz = speed;
-            if (motors[i].dir_level) {
-                motors[i].total_commanded_steps++;
-            } else {
-                motors[i].total_commanded_steps--;
-            }
-        }
+        motors[i].current_speed_hz = speed;
+        motors[i].target_speed_hz = speed;
+        motors[i].total_commanded_steps++;
     }
 
-    if (any_pulse) {
-        esp_rom_delay_us(STEP_PULSE_US);
-        for (int i = 0; i < TMC_NUM_MOTORS; i++) {
-            if (pulse[i]) {
-                gpio_set_level(motors[i].step_pin, 0);
-            }
-        }
+    int64_t period_us = 1000000LL / speed;
+    if (period_us < 50) {
+        period_us = 50;
     }
+
+    esp_timer_start_once(step_timer, period_us);
 }
 
 // -----------------------------------------------------------------------------
@@ -172,12 +159,23 @@ static void step_timer_callback(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG_MAIN, "==================================================");
-    ESP_LOGI(TAG_MAIN, "  ESP32-S3 TMC2209 4-MOTOR CONTROLLER STARTING    ");
+    ESP_LOGI(TAG_MAIN, "  ESP32-S3 TMC2209 STEPPER CONTROLLER STARTING    ");
     ESP_LOGI(TAG_MAIN, "==================================================");
 
     // 1. Initialize data structures & hardware GPIOs
     tmc_init_motor_structures();
     tmc_init_hardware_pins();
+
+    // Explicitly configure all step/dir/en pins
+    gpio_set_level(GPIO_NUM_4, 0);      // Active low enable
+    gpio_set_level(GPIO_NUM_2, 1);      // Direction
+    gpio_set_level(GPIO_NUM_6, 1);
+    gpio_set_level(GPIO_NUM_8, 1);
+    gpio_set_level(GPIO_NUM_13, 1);
+    gpio_set_level(GPIO_NUM_9, 0);      // Step low
+    gpio_set_level(GPIO_NUM_5, 0);
+    gpio_set_level(GPIO_NUM_7, 0);
+    gpio_set_level(GPIO_NUM_12, 0);
 
     // 2. Initialize ADC for analog potentiometer speed control
     adc_setup();
@@ -199,64 +197,58 @@ void app_main(void)
     uart_setup();
     vTaskDelay(pdMS_TO_TICKS(150));      // Driver power stabilization time
 
-    // 4. Scan and configure all 4 driver addresses (0, 1, 2, 3)
+    // 6. Scan and configure drivers on UART (5 verified register writes)
     tmc_scan_and_configure_all();
 
-    // 5. Motor setup: Drivers are already configured with proven high-torque settings
-    // (4 microsteps, full IRUN=31 current, SpreadCycle, no CoolStep/StallGuard interference)
-    ESP_LOGI(TAG_MAIN, "Motors configured for high-torque 4-microstep operation (matching verified script)");
-
-    // 6. Start the periodic multi-motor pulse generation timer
+    // 7. Create step timer (single-shot reschedule, matching verified script)
     esp_timer_create_args_t timer_args = {
         .callback = &step_timer_callback,
         .arg = NULL,
         .dispatch_method = ESP_TIMER_TASK,
-        .name = "tmc_step_timer",
+        .name = "step_timer",
         .skip_unhandled_events = true,
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &step_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(step_timer, TIMER_BASE_INTERVAL_US));
 
-    ESP_LOGI(TAG_MAIN, "Timer pulse engine running at %d us tick resolution", TIMER_BASE_INTERVAL_US);
+    int pot_raw = 0;
+    int pot_speed = read_pot_mapped(&pot_raw);
+    target_speed_hz = pot_speed;
+    if (pot_speed > 0) {
+        timer_running = true;
+        ESP_ERROR_CHECK(esp_timer_start_once(step_timer, 1000000LL / pot_speed));
+    }
+
+    ESP_LOGI(TAG_MAIN, "Stepper engine active: pulses routed to GPIO 9, 5, 7, 12");
     ESP_LOGI(TAG_MAIN, "Entering real-time potentiometer demo loop...");
 
     uint32_t loop_counter = 0;
 
     while (1) {
-        // Read target speed and raw ADC value from analog potentiometer
-        int pot_raw = 0;
-        int pot_speed = read_pot_mapped(&pot_raw);
+        int raw = 0;
+        int speed = read_pot_mapped(&raw);
+        target_speed_hz = speed;
 
-        // Update target speed for all present motors
-        for (uint8_t i = 0; i < TMC_NUM_MOTORS; i++) {
-            if (motors[i].present) {
-                // Keep motor enabled
-                gpio_set_level(motors[i].en_pin, 0);
-
-                // If not running in UART VACTUAL mode, update step frequency
-                if (motors[i].motion_mode == MOTION_MODE_STEP_DIR) {
-                    tmc_set_motor_speed_hz(i, pot_speed);
-                    motors[i].is_stalled = false;
-                }
-            } else {
-                // If a driver was missing at boot, attempt periodic retry probe
-                if ((loop_counter % 20) == 0) {
-                    if (tmc_probe_motor(i, false)) {
-                        ESP_LOGI(TAG_MAIN, "Driver at address %u hot-plugged! Configuring...", i);
-                        tmc_configure_motor(i);
-                    }
-                }
-            }
+        // Wake up timer if resuming from stop
+        if (speed > 0 && !timer_running) {
+            timer_running = true;
+            esp_timer_start_once(step_timer, 1000000LL / speed);
         }
 
-        // Print telemetry report every ~500 ms (every 10 loop iterations)
-        if ((loop_counter % 10) == 0) {
+        // Keep enable active LOW and direction set
+        gpio_set_level(GPIO_NUM_4, 0);
+        gpio_set_level(GPIO_NUM_2, 1);
+        gpio_set_level(GPIO_NUM_6, 1);
+        gpio_set_level(GPIO_NUM_8, 1);
+        gpio_set_level(GPIO_NUM_13, 1);
+
+        // Print telemetry report every ~500 ms (every 5 loop iterations)
+        if ((loop_counter % 5) == 0) {
             tmc_print_all_motors_status();
-            ESP_LOGI(TAG_MAIN, "[POT DEMO] ADC Raw: %4d | Commanded Speed: %5d Hz %s",
-                     pot_raw, pot_speed, (pot_speed == 0) ? "(STOPPED)" : "(RUNNING)");
+            ESP_LOGI(TAG_MAIN, "[POT DEMO] ADC Raw: %4d | Commanded: %5d Hz | Actual: %5d Hz %s",
+                     raw, speed, current_speed_hz, (speed == 0) ? "(STOPPED)" : "(RUNNING)");
         }
 
         loop_counter++;
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
