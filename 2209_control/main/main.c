@@ -1,17 +1,15 @@
 /**
  * @file main.c
- * @brief Multi-Motor Stepper Controller for ESP32-S3 with 4x TMC2209 Drivers.
+ * @brief Stepper Controller for ESP32-S3 with TMC2209 Driver.
  * 
- * Supports simultaneous control of 4 TMC2209 drivers on addresses 0, 1, 2, and 3.
- * Features:
- * - Simultaneous 4-motor pulse generation via high-resolution periodic timer
- * - Potentiometer analog speed regulation
- * - Direct UART velocity mode (VACTUAL)
- * - StallGuard4 load monitoring & sensorless stall detection
- * - CoolStep dynamic current reduction
- * - Microstepping resolution & chopper configuration over UART
- * - Hardware direction inversion & software enable/freewheeling
- * - Modular robotics trajectory and joint positioning hooks
+ * Based directly on verified high-torque standalone implementation:
+ * - 4 microsteps (CHOPCONF 0x16000054u) with 256 interpolation
+ * - Full 100% run current (IRUN=31, IHOLD=16, IHOLDDELAY=1)
+ * - SpreadCycle chopper mode (GCONF 0x000000C4u)
+ * - Dynamic single-shot step timer (100 Hz to 12,000 Hz)
+ * - Analog potentiometer speed regulation (GPIO 1 / ADC1_CH0)
+ * - Pulses routed to STEP_PIN (GPIO 9) and secondary motor pins (5, 7, 12)
+ * - Integrated Wireless OTA updates
  */
 
 #include <stdio.h>
@@ -29,73 +27,155 @@
 #include "driver/uart.h"
 #include "esp_adc/adc_oneshot.h"
 #include "nvs_flash.h"
-#include "tmc2209.h"
 #include "ota_update.h"
 
-#define TAG_MAIN               "MAIN_APP"
+// ---------------------------------------------------------------- pins
+#define STEP_PIN          GPIO_NUM_9      // Primary motor STEP pin (GPIO 9)
+#define DIR_PIN           GPIO_NUM_2      // Primary motor DIR pin (GPIO 2)
+#define EN_PIN            GPIO_NUM_4      // Shared motor EN pin (Active LOW)
+#define POT_PIN           GPIO_NUM_1      // ADC1_CH0 on ESP32-S3
+#define UART_TX_PIN       GPIO_NUM_10     // ESP32 TX -> driver RX
+#define UART_RX_PIN       GPIO_NUM_11     // ESP32 RX <- driver TX
+#define UART_PORT         UART_NUM_1
 
-// -----------------------------------------------------------------------------
-// Pin & Peripheral Definitions
-// -----------------------------------------------------------------------------
-#define POT_PIN                GPIO_NUM_1      // ADC1_CH0 on ESP32-S3
-#define UART_TX_PIN            GPIO_NUM_10     // ESP32 TX -> TMC2209 PDN_UART
-#define UART_RX_PIN            GPIO_NUM_11     // ESP32 RX <- TMC2209 PDN_UART
-#define UART_PORT              UART_NUM_1
+// Additional multi-motor pins (simultaneous pulse routing)
+#define MOTOR1_STEP_PIN   GPIO_NUM_5
+#define MOTOR1_DIR_PIN    GPIO_NUM_6
+#define MOTOR2_STEP_PIN   GPIO_NUM_7
+#define MOTOR2_DIR_PIN    GPIO_NUM_8
+#define MOTOR3_STEP_PIN   GPIO_NUM_12
+#define MOTOR3_DIR_PIN    GPIO_NUM_13
 
-// -----------------------------------------------------------------------------
-// Speed & Stepping Parameters (Potentiometer Demo)
-// -----------------------------------------------------------------------------
-#define STEP_PULSE_US          5               // 5 us pulse width (matches working script)
-#define POT_DEADBAND_LOW       40              // Deadband count for solid zero
-#define MIN_RUN_SPEED_HZ       100             // 100 Hz starting step rate (matches working script)
-#define MAX_SPEED_HZ           12000           // 12000 Hz max step rate (matches working script)
+// ------------------------------------------------------------ stepping
+#define STEP_PULSE_US     5
+#define MIN_SPEED_HZ      100
+#define MAX_SPEED_HZ      12000
 
-static volatile int target_speed_hz  = MIN_RUN_SPEED_HZ;
-static volatile int current_speed_hz = 0;
-static volatile bool timer_running   = false;
+// ------------------------------------------------------- TMC2209 setup
+#define TMC_IRUN          31   // 0..31, run current scale (31 = 100% of what the sense resistor allows)
+#define TMC_IHOLD         16   // 0..31, standstill current scale
+#define TMC_IHOLDDELAY    1
+
+// Register addresses
+#define REG_GCONF         0x00
+#define REG_IFCNT         0x02
+#define REG_IHOLD_IRUN    0x10
+#define REG_TPOWERDOWN    0x11
+#define REG_DRV_STATUS    0x6F
+#define REG_CHOPCONF      0x6C
+#define REG_PWMCONF       0x70
+
+static const char *TAG = "tmc2209_main";
+
+static volatile int target_speed_hz  = MIN_SPEED_HZ;
+static volatile int current_speed_hz = MIN_SPEED_HZ;
 static esp_timer_handle_t step_timer = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 
-// -----------------------------------------------------------------------------
-// Potentiometer Analog Reading
-// -----------------------------------------------------------------------------
-static void adc_setup(void)
-{
-    adc_oneshot_unit_init_cfg_t init_config = {
-        .unit_id = ADC_UNIT_1,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
+static uint8_t tmc_addr  = 0;      // discovered at runtime (MS1/MS2 select 0..3)
+static bool    tmc_ready = false;  // true once driver found and configured
 
-    adc_oneshot_chan_cfg_t channel_cfg = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &channel_cfg));
+// ------------------------------------------------------------------ CRC
+// Computes CRC8 over datagram[0 .. length-2] and stores it in datagram[length-1]
+static void tmc_calc_crc(uint8_t *datagram, uint8_t datagram_length)
+{
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < (datagram_length - 1); i++) {
+        uint8_t currentByte = datagram[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if ((crc >> 7) ^ (currentByte & 0x01)) {
+                crc = (uint8_t)((crc << 1) ^ 0x07u);
+            } else {
+                crc = (uint8_t)(crc << 1);
+            }
+            currentByte >>= 1;
+        }
+    }
+    datagram[datagram_length - 1] = crc;
 }
 
-static int read_pot_mapped(int *out_raw)
+// ------------------------------------------------------- register access
+static void tmc_write_reg(uint8_t addr, uint8_t reg, uint32_t value)
 {
-    int adc_raw = 0;
-    if (adc_handle != NULL) {
-        adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &adc_raw);
-    }
-    if (out_raw != NULL) {
-        *out_raw = adc_raw;
-    }
+    uint8_t datagram[8] = {0};
 
-    if (adc_raw <= POT_DEADBAND_LOW) {
-        return 0;
-    }
+    datagram[0] = 0x05;
+    datagram[1] = addr;
+    datagram[2] = (uint8_t)(reg | 0x80u);
+    datagram[3] = (uint8_t)((value >> 24) & 0xFFu);
+    datagram[4] = (uint8_t)((value >> 16) & 0xFFu);
+    datagram[5] = (uint8_t)((value >> 8) & 0xFFu);
+    datagram[6] = (uint8_t)(value & 0xFFu);
 
-    int mapped = MIN_RUN_SPEED_HZ + ((adc_raw - POT_DEADBAND_LOW) * (MAX_SPEED_HZ - MIN_RUN_SPEED_HZ)) / (4095 - POT_DEADBAND_LOW);
-    if (mapped > MAX_SPEED_HZ) mapped = MAX_SPEED_HZ;
-    return mapped;
+    tmc_calc_crc(datagram, sizeof(datagram));
+
+    uart_write_bytes(UART_PORT, (const char *)datagram, sizeof(datagram));
+    uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(10));
+    uart_flush_input(UART_PORT);
+    vTaskDelay(pdMS_TO_TICKS(2));
 }
 
-// -----------------------------------------------------------------------------
-// UART Bus Initialization (Single-Wire / Half-Duplex for TMC2209)
-// -----------------------------------------------------------------------------
+// Returns true only if a reply with correct sync, address (0xFF), register and CRC was received.
+static bool tmc_read_reg_ex(uint8_t addr, uint8_t reg, uint32_t *out, bool verbose)
+{
+    uint8_t req[4] = {0x05, addr, reg, 0};
+    tmc_calc_crc(req, sizeof(req));
+
+    uint8_t buf[16];
+    uart_flush_input(UART_PORT);
+    uart_write_bytes(UART_PORT, (const char *)req, sizeof(req));
+    uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(10));
+
+    int len = uart_read_bytes(UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(20));
+
+    if (verbose) {
+        printf("Scanning Addr %u | TX: %02X %02X %02X %02X | RX (%d bytes):",
+               addr, req[0], req[1], req[2], req[3], len);
+        for (int i = 0; i < len; i++) printf(" %02X", buf[i]);
+    }
+
+    for (int i = 0; i + 8 <= len; i++) {
+        if (buf[i] == 0x05 && buf[i + 1] == 0xFF && buf[i + 2] == reg) {
+            uint8_t crc_buf[8];
+            memcpy(crc_buf, &buf[i], 8);
+            tmc_calc_crc(crc_buf, 8);
+            if (crc_buf[7] != buf[i + 7]) {
+                if (verbose) printf(" | bad CRC\n");
+                return false;
+            }
+            *out = ((uint32_t)buf[i + 3] << 24) |
+                   ((uint32_t)buf[i + 4] << 16) |
+                   ((uint32_t)buf[i + 5] << 8)  |
+                    (uint32_t)buf[i + 6];
+            if (verbose) printf(" | BINGO! Valid reply on address %u\n", addr);
+            return true;
+        }
+    }
+    if (verbose) printf(" | no valid reply\n");
+    return false;
+}
+
+static bool tmc_read_reg(uint8_t addr, uint8_t reg, uint32_t *out)
+{
+    return tmc_read_reg_ex(addr, reg, out, false);
+}
+
+// Probe addresses 0..3 by reading IFCNT; sets tmc_addr on success.
+static bool tmc_find_driver(void)
+{
+    for (uint8_t addr = 0; addr < 4; addr++) {
+        uint32_t v;
+        if (tmc_read_reg_ex(addr, REG_IFCNT, &v, true)) {
+            tmc_addr = addr;
+            ESP_LOGI(TAG, "TMC2209 found at address %u (IFCNT=%u)", addr, (unsigned)v);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
+// ------------------------------------------------------------ driver init
 static void uart_setup(void)
 {
     uart_config_t uart_cfg = {
@@ -113,37 +193,121 @@ static void uart_setup(void)
     ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 256, 256, 0, NULL, 0));
 }
 
-// -----------------------------------------------------------------------------
-// Step Pulse Timer Callback (Matching Verified Script)
-// -----------------------------------------------------------------------------
+static bool tmc2209_configure(void)
+{
+    if (!tmc_find_driver()) {
+        return false;
+    }
+
+    uint32_t ifcnt_before = 0, ifcnt_after = 0;
+    bool have_before = tmc_read_reg(tmc_addr, REG_IFCNT, &ifcnt_before);
+
+    // GCONF: bit2 en_spreadCycle, bit6 pdn_disable, bit7 mstep_reg_select
+    tmc_write_reg(tmc_addr, REG_GCONF, 0x000000C4u);
+
+    // IHOLD_IRUN: IHOLD[4:0], IRUN[12:8], IHOLDDELAY[19:16]
+    uint32_t ihold_irun = ((uint32_t)TMC_IHOLDDELAY << 16) |
+                          ((uint32_t)TMC_IRUN << 8) |
+                           (uint32_t)TMC_IHOLD;
+    tmc_write_reg(tmc_addr, REG_IHOLD_IRUN, ihold_irun);
+
+    tmc_write_reg(tmc_addr, REG_TPOWERDOWN, 0x00000004u);
+
+    // CHOPCONF: TOFF=4, HSTRT=5, MRES=6 (4 microsteps), intpol=1
+    tmc_write_reg(tmc_addr, REG_CHOPCONF, 0x16000054u);
+
+    // PWMCONF: documented reset default (stealthChop autoscale on)
+    tmc_write_reg(tmc_addr, REG_PWMCONF, 0xC10D0024u);
+
+    // Verify the driver actually accepted our 5 writes
+    bool have_after = tmc_read_reg(tmc_addr, REG_IFCNT, &ifcnt_after);
+    if (have_before && have_after) {
+        uint8_t delta = (uint8_t)(ifcnt_after - ifcnt_before);
+        if (delta == 5) {
+            ESP_LOGI(TAG, "TMC2209 configured OK (IFCNT %u -> %u, 5 writes accepted)",
+                     (unsigned)ifcnt_before, (unsigned)ifcnt_after);
+        } else {
+            ESP_LOGW(TAG, "IFCNT changed by %u, expected 5 - some writes were rejected",
+                     (unsigned)delta);
+        }
+    } else {
+        ESP_LOGW(TAG, "Could not read IFCNT to verify writes");
+    }
+    return true;
+}
+
+// -------------------------------------------------------------------- pot
+static int read_pot_mapped(void)
+{
+    int adc_raw = 0;
+    if (adc_handle != NULL) {
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &adc_raw));
+    }
+
+    int mapped = (adc_raw * (MAX_SPEED_HZ - MIN_SPEED_HZ)) / 4095;
+    mapped += MIN_SPEED_HZ;
+    if (mapped < MIN_SPEED_HZ) mapped = MIN_SPEED_HZ;
+    if (mapped > MAX_SPEED_HZ) mapped = MAX_SPEED_HZ;
+    return mapped;
+}
+
+// ------------------------------------------------------------ status print
+static void tmc2209_print_status_debug(void)
+{
+    uint32_t status;
+    if (!tmc_read_reg(tmc_addr, REG_DRV_STATUS, &status)) {
+        printf("DRV_STATUS read failed (addr %u)\n", tmc_addr);
+        return;
+    }
+
+    uint32_t otpw = (status >> 0) & 1u;
+    uint32_t ot   = (status >> 1) & 1u;
+    uint32_t s2ga = (status >> 2) & 1u;
+    uint32_t s2gb = (status >> 3) & 1u;
+    uint32_t ola  = (status >> 6) & 1u;
+    uint32_t olb  = (status >> 7) & 1u;
+    uint8_t  cs   = (status >> 16) & 0x1Fu;
+    uint32_t stst = (status >> 31) & 1u;
+
+    printf("addr=%u status=0x%08X | target=%dHz actual=%dHz | CS=%u | flags:",
+           tmc_addr, (unsigned)status,
+           target_speed_hz, current_speed_hz, (unsigned)cs);
+
+    if (otpw) printf(" OTPW");
+    if (ot)   printf(" OT");
+    if (s2ga) printf(" S2GA");
+    if (s2gb) printf(" S2GB");
+    if (ola)  printf(" OLA");
+    if (olb)  printf(" OLB");
+    if (stst) printf(" STANDSTILL");
+    if (!(otpw | ot | s2ga | s2gb | ola | olb | stst)) printf(" none");
+
+    printf("\n");
+    fflush(stdout);
+}
+
+// ----------------------------------------------------------- step timer
 static void step_timer_callback(void *arg)
 {
     int speed = target_speed_hz;
     if (speed <= 0) {
-        timer_running = false;
-        current_speed_hz = 0;
         return;
     }
 
-    // Simultaneously pulse all motor STEP pins (GPIO 9, 5, 7, 12)
-    gpio_set_level(GPIO_NUM_9, 1);
-    gpio_set_level(GPIO_NUM_5, 1);
-    gpio_set_level(GPIO_NUM_7, 1);
-    gpio_set_level(GPIO_NUM_12, 1);
+    // Simultaneously pulse primary STEP pin (GPIO 9) and secondary motor pins
+    gpio_set_level(STEP_PIN, 1);
+    gpio_set_level(MOTOR1_STEP_PIN, 1);
+    gpio_set_level(MOTOR2_STEP_PIN, 1);
+    gpio_set_level(MOTOR3_STEP_PIN, 1);
 
     esp_rom_delay_us(STEP_PULSE_US);
 
-    gpio_set_level(GPIO_NUM_9, 0);
-    gpio_set_level(GPIO_NUM_5, 0);
-    gpio_set_level(GPIO_NUM_7, 0);
-    gpio_set_level(GPIO_NUM_12, 0);
+    gpio_set_level(STEP_PIN, 0);
+    gpio_set_level(MOTOR1_STEP_PIN, 0);
+    gpio_set_level(MOTOR2_STEP_PIN, 0);
+    gpio_set_level(MOTOR3_STEP_PIN, 0);
 
     current_speed_hz = speed;
-    for (int i = 0; i < TMC_NUM_MOTORS; i++) {
-        motors[i].current_speed_hz = speed;
-        motors[i].target_speed_hz = speed;
-        motors[i].total_commanded_steps++;
-    }
 
     int64_t period_us = 1000000LL / speed;
     if (period_us < 50) {
@@ -153,54 +317,70 @@ static void step_timer_callback(void *arg)
     esp_timer_start_once(step_timer, period_us);
 }
 
-// -----------------------------------------------------------------------------
-// Application Main
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------------ main
 void app_main(void)
 {
-    ESP_LOGI(TAG_MAIN, "==================================================");
-    ESP_LOGI(TAG_MAIN, "  ESP32-S3 TMC2209 STEPPER CONTROLLER STARTING    ");
-    ESP_LOGI(TAG_MAIN, "==================================================");
+    // Configure all motor STEP, DIR, and EN pins as outputs
+    uint64_t pin_mask = (1ULL << STEP_PIN)        | (1ULL << DIR_PIN)        | (1ULL << EN_PIN) |
+                        (1ULL << MOTOR1_STEP_PIN) | (1ULL << MOTOR1_DIR_PIN) |
+                        (1ULL << MOTOR2_STEP_PIN) | (1ULL << MOTOR2_DIR_PIN) |
+                        (1ULL << MOTOR3_STEP_PIN) | (1ULL << MOTOR3_DIR_PIN);
 
-    // 1. Initialize data structures & hardware GPIOs
-    tmc_init_motor_structures();
-    tmc_init_hardware_pins();
+    gpio_config_t io_conf = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
 
-    // Explicitly configure all step/dir/en pins
-    gpio_set_level(GPIO_NUM_4, 0);      // Active low enable
-    gpio_set_level(GPIO_NUM_2, 1);      // Direction
-    gpio_set_level(GPIO_NUM_6, 1);
-    gpio_set_level(GPIO_NUM_8, 1);
-    gpio_set_level(GPIO_NUM_13, 1);
-    gpio_set_level(GPIO_NUM_9, 0);      // Step low
-    gpio_set_level(GPIO_NUM_5, 0);
-    gpio_set_level(GPIO_NUM_7, 0);
-    gpio_set_level(GPIO_NUM_12, 0);
+    // Initialize initial pin states
+    gpio_set_level(EN_PIN, 0);           // Active LOW: all drivers enabled
+    gpio_set_level(DIR_PIN, 1);          // Forward direction
+    gpio_set_level(MOTOR1_DIR_PIN, 1);
+    gpio_set_level(MOTOR2_DIR_PIN, 1);
+    gpio_set_level(MOTOR3_DIR_PIN, 1);
+    gpio_set_level(STEP_PIN, 0);
+    gpio_set_level(MOTOR1_STEP_PIN, 0);
+    gpio_set_level(MOTOR2_STEP_PIN, 0);
+    gpio_set_level(MOTOR3_STEP_PIN, 0);
 
-    // 2. Initialize ADC for analog potentiometer speed control
-    adc_setup();
+    // Initialize ADC for analog potentiometer speed control
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
-    // 3. Initialize NVS Flash (required for Wi-Fi stack & persistent calibration)
+    adc_oneshot_chan_cfg_t channel_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &channel_cfg));
+
+    // Initialize half-duplex UART for Trinamic bus
+    uart_setup();
+    vTaskDelay(pdMS_TO_TICKS(100));      // Driver power stabilization time
+
+    // Discover driver and configure registers
+    tmc_ready = tmc2209_configure();
+    if (!tmc_ready) {
+        ESP_LOGW(TAG, "No TMC2209 reply on addresses 0-3. Check VIO, GND, TX/RX crossing, MS1/MS2. Will retry.");
+    }
+
+    // Initialize NVS Flash & Wireless OTA Web Portal
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
-
-    // 4. Initialize Wireless Over-The-Air (OTA) System (SoftAP + Web Server)
     ota_system_init(OTA_DEFAULT_STA_SSID, OTA_DEFAULT_STA_PASS);
     ota_confirm_app_valid();
     ota_print_network_info();
 
-    // 5. Initialize half-duplex UART for Trinamic bus
-    uart_setup();
-    vTaskDelay(pdMS_TO_TICKS(150));      // Driver power stabilization time
-
-    // 6. Scan and configure drivers on UART (5 verified register writes)
-    tmc_scan_and_configure_all();
-
-    // 7. Create step timer (single-shot reschedule, matching verified script)
+    // Start single-shot step timer (continuously reschedules itself)
     esp_timer_create_args_t timer_args = {
         .callback = &step_timer_callback,
         .arg = NULL,
@@ -209,46 +389,25 @@ void app_main(void)
         .skip_unhandled_events = true,
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &step_timer));
+    ESP_ERROR_CHECK(esp_timer_start_once(step_timer, 1000000LL / target_speed_hz));
 
-    int pot_raw = 0;
-    int pot_speed = read_pot_mapped(&pot_raw);
-    target_speed_hz = pot_speed;
-    if (pot_speed > 0) {
-        timer_running = true;
-        ESP_ERROR_CHECK(esp_timer_start_once(step_timer, 1000000LL / pot_speed));
-    }
-
-    ESP_LOGI(TAG_MAIN, "Stepper engine active: pulses routed to GPIO 9, 5, 7, 12");
-    ESP_LOGI(TAG_MAIN, "Entering real-time potentiometer demo loop...");
-
-    uint32_t loop_counter = 0;
+    ESP_LOGI(TAG, "ESP32-S3 port initialized; stepper driver and ADC ready (pulses on GPIO 9, 5, 7, 12)");
 
     while (1) {
-        int raw = 0;
-        int speed = read_pot_mapped(&raw);
-        target_speed_hz = speed;
+        target_speed_hz = read_pot_mapped();
 
-        // Wake up timer if resuming from stop
-        if (speed > 0 && !timer_running) {
-            timer_running = true;
-            esp_timer_start_once(step_timer, 1000000LL / speed);
+        gpio_set_level(DIR_PIN, 1);
+        gpio_set_level(MOTOR1_DIR_PIN, 1);
+        gpio_set_level(MOTOR2_DIR_PIN, 1);
+        gpio_set_level(MOTOR3_DIR_PIN, 1);
+        gpio_set_level(EN_PIN, 0);
+
+        if (!tmc_ready) {
+            tmc_ready = tmc2209_configure();   // keep retrying until driver answers
+        } else {
+            tmc2209_print_status_debug();
         }
 
-        // Keep enable active LOW and direction set
-        gpio_set_level(GPIO_NUM_4, 0);
-        gpio_set_level(GPIO_NUM_2, 1);
-        gpio_set_level(GPIO_NUM_6, 1);
-        gpio_set_level(GPIO_NUM_8, 1);
-        gpio_set_level(GPIO_NUM_13, 1);
-
-        // Print telemetry report every ~500 ms (every 5 loop iterations)
-        if ((loop_counter % 5) == 0) {
-            tmc_print_all_motors_status();
-            ESP_LOGI(TAG_MAIN, "[POT DEMO] ADC Raw: %4d | Commanded: %5d Hz | Actual: %5d Hz %s",
-                     raw, speed, current_speed_hz, (speed == 0) ? "(STOPPED)" : "(RUNNING)");
-        }
-
-        loop_counter++;
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
