@@ -345,6 +345,33 @@ bool tmc_stallguard_enable(uint8_t addr, uint8_t threshold, uint32_t tcoolthrs)
 bool tmc_stallguard_check_stall(uint8_t addr, bool *is_stalled)
 {
     if (addr >= TMC_NUM_MOTORS || is_stalled == NULL) return false;
+
+    // StallGuard4 operates on motor back-EMF, which is zero at standstill or low velocities.
+    // Reading SG_RESULT below operational threshold produces 0 by hardware design.
+    // Guard against false stall lockouts at standstill or startup:
+    if (motors[addr].motion_mode == MOTION_MODE_STEP_DIR) {
+        if (motors[addr].target_speed_hz < 1000 || motors[addr].current_speed_hz < 800) {
+            motors[addr].is_stalled = false;
+            *is_stalled = false;
+            return true;
+        }
+    } else {
+        int32_t abs_vel = (motors[addr].vactual_velocity < 0) ? -motors[addr].vactual_velocity : motors[addr].vactual_velocity;
+        if (abs_vel < 1000) {
+            motors[addr].is_stalled = false;
+            *is_stalled = false;
+            return true;
+        }
+    }
+
+    // Check driver standstill status bit
+    tmc_drv_status_t st;
+    if (tmc_get_drv_status(addr, &st) && st.standstill) {
+        motors[addr].is_stalled = false;
+        *is_stalled = false;
+        return true;
+    }
+
     uint16_t sg_val = 0;
     if (!tmc_stallguard_get_result(addr, &sg_val)) {
         return false;
@@ -359,6 +386,13 @@ bool tmc_stallguard_check_stall(uint8_t addr, bool *is_stalled)
         robot_arm_stallguard_event_callback(addr, sg_val);
     }
     return true;
+}
+
+void tmc_clear_stall(uint8_t addr)
+{
+    if (addr < TMC_NUM_MOTORS) {
+        motors[addr].is_stalled = false;
+    }
 }
 
 bool tmc_sensorless_homing(uint8_t addr, int32_t homing_velocity, uint8_t sg_threshold)
@@ -532,6 +566,7 @@ void tmc_set_motor_speed_hz(uint8_t addr, int speed_hz)
 {
     if (addr >= TMC_NUM_MOTORS) return;
     motors[addr].target_speed_hz = speed_hz;
+    motors[addr].is_stalled = false;
 }
 
 void tmc_set_motor_direction(uint8_t addr, bool forward)
@@ -610,6 +645,7 @@ void tmc_stop_all_motors(void)
     for (uint8_t i = 0; i < TMC_NUM_MOTORS; i++) {
         motors[i].target_speed_hz = 0;
         motors[i].current_speed_hz = 0;
+        motors[i].is_stalled = false;
         if (motors[i].motion_mode == MOTION_MODE_UART_VACTUAL) {
             tmc_stop_vactual(i);
         }

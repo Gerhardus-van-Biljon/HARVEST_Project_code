@@ -244,12 +244,18 @@ void app_main(void)
                 // If not running in UART VACTUAL mode, update step frequency
                 if (motors[i].motion_mode == MOTION_MODE_STEP_DIR) {
                     tmc_set_motor_speed_hz(i, pot_speed);
+                    motors[i].is_stalled = false;
                 }
 
-                // Periodically check StallGuard4 status over UART (every 100 ms)
-                if ((loop_counter % 2) == 0) {
-                    bool stalled = false;
-                    tmc_stallguard_check_stall(i, &stalled);
+                // In potentiometer demo mode, monitor StallGuard4 load at operational speeds without killing motor
+                if ((loop_counter % 2) == 0 && pot_speed >= 1500) {
+                    uint16_t sg_val = 0;
+                    if (tmc_stallguard_get_result(i, &sg_val)) {
+                        if (sg_val <= ((uint16_t)motors[i].sg_threshold * 2)) {
+                            ESP_LOGW(TAG_MAIN, "Joint %u high load/contact detected (SG4=%u, threshold=%u)",
+                                     i, sg_val, motors[i].sg_threshold);
+                        }
+                    }
                 }
             } else {
                 // If a driver was missing at boot, attempt periodic retry probe

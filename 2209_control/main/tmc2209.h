@@ -159,6 +159,7 @@ bool tmc_stallguard_set_threshold(uint8_t addr, uint8_t threshold);
 bool tmc_stallguard_get_result(uint8_t addr, uint16_t *out_result);
 bool tmc_stallguard_enable(uint8_t addr, uint8_t threshold, uint32_t tcoolthrs);
 bool tmc_stallguard_check_stall(uint8_t addr, bool *is_stalled);
+void tmc_clear_stall(uint8_t addr);
 bool tmc_sensorless_homing(uint8_t addr, int32_t homing_velocity, uint8_t sg_threshold);
 
 // -----------------------------------------------------------------------------
