@@ -5,7 +5,6 @@
 
 #include "ota_update.h"
 #include "tmc2209.h"
-#include "as5600.h"
 
 #include <stdio.h>
 #include <string.h>

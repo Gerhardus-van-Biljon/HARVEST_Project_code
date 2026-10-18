@@ -4,7 +4,6 @@
  */
 
 #include "tmc2209.h"
-#include "as5600.h"
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -726,12 +725,10 @@ bool tmc_get_position_tracking_error(uint8_t addr, float *out_error_deg)
     motors[addr].commanded_motor_deg = motor_turns * 360.0f;
     // 20:1 reduction with inverted direction
     motors[addr].commanded_output_deg = -(motors[addr].commanded_motor_deg / 20.0f);
-
-    float actual_output_deg = as5600_get_output_angle_deg(addr);
-    motors[addr].tracking_error_deg = motors[addr].commanded_output_deg - actual_output_deg;
+    motors[addr].tracking_error_deg = 0.0f;
 
     if (out_error_deg != NULL) {
-        *out_error_deg = motors[addr].tracking_error_deg;
+        *out_error_deg = 0.0f;
     }
     return true;
 }
@@ -743,7 +740,6 @@ void tmc_reset_position(uint8_t addr)
         motors[addr].commanded_motor_deg = 0.0f;
         motors[addr].commanded_output_deg = 0.0f;
         motors[addr].tracking_error_deg = 0.0f;
-        as5600_zero_output_position(addr);
     }
 }
 
@@ -754,7 +750,7 @@ void robot_arm_joint_move_dummy(uint8_t joint_id, float target_angle_deg, float 
 {
     if (joint_id >= TMC_NUM_MOTORS) return;
 
-    float current_out_deg = as5600_get_output_angle_deg(joint_id);
+    float current_out_deg = motors[joint_id].commanded_output_deg;
     ESP_LOGI("ROBOT_DUMMY", "Joint %u commanded to %.2f deg (current=%.2f deg, err=%.2f deg) at %.2f deg/s",
              joint_id, target_angle_deg, current_out_deg,
              target_angle_deg - current_out_deg, speed_deg_s);

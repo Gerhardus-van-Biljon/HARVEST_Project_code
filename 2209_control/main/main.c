@@ -30,7 +30,6 @@
 #include "esp_adc/adc_oneshot.h"
 #include "nvs_flash.h"
 #include "tmc2209.h"
-#include "as5600.h"
 #include "ota_update.h"
 
 #define TAG_MAIN               "MAIN_APP"
@@ -44,11 +43,12 @@
 #define UART_PORT              UART_NUM_1
 
 // -----------------------------------------------------------------------------
-// Speed & Stepping Parameters
+// Speed & Stepping Parameters (Potentiometer Demo)
 // -----------------------------------------------------------------------------
 #define STEP_PULSE_US          2               // TMC2209 requires min 100ns pulse width
-#define MIN_SPEED_HZ           100             // Minimum step rate in Hz
-#define MAX_SPEED_HZ           12000           // Maximum step rate in Hz
+#define POT_DEADBAND_LOW       80              // ADC counts <= this threshold stop the motors
+#define MIN_RUN_SPEED_HZ       150             // Minimum starting step rate in Hz
+#define MAX_SPEED_HZ           8000            // Maximum demo step rate in Hz
 #define TIMER_BASE_INTERVAL_US 50              // 50 us timer tick (20 kHz base rate)
 
 static esp_timer_handle_t step_timer = NULL;
@@ -72,17 +72,23 @@ static void adc_setup(void)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &channel_cfg));
 }
 
-static int read_pot_mapped(void)
+static int read_pot_mapped(int *out_raw)
 {
     int adc_raw = 0;
     if (adc_handle != NULL) {
         adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &adc_raw);
     }
+    if (out_raw != NULL) {
+        *out_raw = adc_raw;
+    }
 
-    // Map 12-bit ADC (0..4095) to [MIN_SPEED_HZ .. MAX_SPEED_HZ]
-    int mapped = (adc_raw * (MAX_SPEED_HZ - MIN_SPEED_HZ)) / 4095;
-    mapped += MIN_SPEED_HZ;
-    if (mapped < MIN_SPEED_HZ) mapped = MIN_SPEED_HZ;
+    // Low deadband: turning pot fully counter-clockwise stops all motors
+    if (adc_raw <= POT_DEADBAND_LOW) {
+        return 0;
+    }
+
+    // Map [POT_DEADBAND_LOW .. 4095] smoothly to [MIN_RUN_SPEED_HZ .. MAX_SPEED_HZ]
+    int mapped = MIN_RUN_SPEED_HZ + ((adc_raw - POT_DEADBAND_LOW) * (MAX_SPEED_HZ - MIN_RUN_SPEED_HZ)) / (4095 - POT_DEADBAND_LOW);
     if (mapped > MAX_SPEED_HZ) mapped = MAX_SPEED_HZ;
     return mapped;
 }
@@ -196,11 +202,7 @@ void app_main(void)
     // 4. Scan and configure all 4 driver addresses (0, 1, 2, 3)
     tmc_scan_and_configure_all();
 
-    // 5. Initialize I2C Master Bus and AS5600 Encoders via TCA9548A Multiplexer
-    as5600_i2c_bus_init(AS5600_I2C_DEFAULT_SDA, AS5600_I2C_DEFAULT_SCL, AS5600_I2C_FREQ_HZ);
-    as5600_init_all();
-
-    // 6. Example setup: Configure StallGuard4 & CoolStep on active motors
+    // 5. Example setup: Configure StallGuard4 & CoolStep on active motors
     for (uint8_t i = 0; i < TMC_NUM_MOTORS; i++) {
         if (motors[i].present) {
             // Set StallGuard sensitivity threshold (e.g., 64)
@@ -212,7 +214,7 @@ void app_main(void)
         }
     }
 
-    // 7. Start the periodic multi-motor pulse generation timer
+    // 6. Start the periodic multi-motor pulse generation timer
     esp_timer_create_args_t timer_args = {
         .callback = &step_timer_callback,
         .arg = NULL,
@@ -224,16 +226,14 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(step_timer, TIMER_BASE_INTERVAL_US));
 
     ESP_LOGI(TAG_MAIN, "Timer pulse engine running at %d us tick resolution", TIMER_BASE_INTERVAL_US);
-    ESP_LOGI(TAG_MAIN, "Entering real-time control loop...");
+    ESP_LOGI(TAG_MAIN, "Entering real-time potentiometer demo loop...");
 
     uint32_t loop_counter = 0;
 
     while (1) {
-        // Sample AS5600 magnetic encoders and update 20:1 gearbox kinematics
-        as5600_update_all();
-
-        // Read target speed from analog potentiometer
-        int pot_speed = read_pot_mapped();
+        // Read target speed and raw ADC value from analog potentiometer
+        int pot_raw = 0;
+        int pot_speed = read_pot_mapped(&pot_raw);
 
         // Update target speed and check StallGuard for all present motors
         for (uint8_t i = 0; i < TMC_NUM_MOTORS; i++) {
@@ -245,10 +245,6 @@ void app_main(void)
                 if (motors[i].motion_mode == MOTION_MODE_STEP_DIR) {
                     tmc_set_motor_speed_hz(i, pot_speed);
                 }
-
-                // Check step-loss tracking error against AS5600 encoder feedback
-                float tracking_err_deg = 0.0f;
-                tmc_get_position_tracking_error(i, &tracking_err_deg);
 
                 // Periodically check StallGuard4 status over UART (every 100 ms)
                 if ((loop_counter % 2) == 0) {
@@ -269,14 +265,8 @@ void app_main(void)
         // Print telemetry report every ~500 ms (every 10 loop iterations)
         if ((loop_counter % 10) == 0) {
             tmc_print_all_motors_status();
-            as5600_print_telemetry();
-        }
-
-        // Dummy test demonstration hook every 50 iterations (~2.5 seconds)
-        if ((loop_counter % 50) == 0 && loop_counter > 0) {
-            float dummy_angles[4] = {15.0f, 30.0f, 45.0f, 60.0f};
-            float dummy_speeds[4] = {10.0f, 10.0f, 10.0f, 10.0f};
-            robot_arm_stream_trajectory_dummy(dummy_angles, dummy_speeds);
+            ESP_LOGI(TAG_MAIN, "[POT DEMO] ADC Raw: %4d | Commanded Speed: %5d Hz %s",
+                     pot_raw, pot_speed, (pot_speed == 0) ? "(STOPPED)" : "(RUNNING)");
         }
 
         loop_counter++;
