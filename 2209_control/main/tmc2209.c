@@ -273,19 +273,18 @@ bool tmc_configure_motor(uint8_t addr)
     motors[addr].shadow_pwmconf = 0xC10D0024u;
     tmc_write_reg(addr, REG_PWMCONF, motors[addr].shadow_pwmconf);
 
-    // 6. SGTHRS & TCOOLTHRS: Default StallGuard settings
-    tmc_write_reg(addr, REG_SGTHRS, (uint32_t)motors[addr].sg_threshold);
-    // TCOOLTHRS = 0xFFFFF ensures StallGuard is active across normal operating speed range
-    tmc_write_reg(addr, REG_TCOOLTHRS, 0x000FFFFFu);
-
-    // Verify writes by checking IFCNT change
+    // Verify the driver actually accepted our 5 writes
     bool have_after = tmc_read_reg(addr, REG_IFCNT, &ifcnt_after);
     if (have_before && have_after) {
         uint8_t delta = (uint8_t)(ifcnt_after - ifcnt_before);
-        ESP_LOGI(TAG, "Motor [%u] configured. Writes verified (IFCNT: %lu -> %lu, delta: %u)",
-                 addr, (unsigned long)ifcnt_before, (unsigned long)ifcnt_after, delta);
+        if (delta == 5) {
+            ESP_LOGI(TAG, "Motor [%u] configured OK (IFCNT %lu -> %lu, 5 writes verified)",
+                     addr, (unsigned long)ifcnt_before, (unsigned long)ifcnt_after);
+        } else {
+            ESP_LOGW(TAG, "Motor [%u] IFCNT delta=%u, expected 5", addr, delta);
+        }
     } else {
-        ESP_LOGI(TAG, "Motor [%u] configured (writes sent)", addr);
+        ESP_LOGW(TAG, "Motor [%u] could not read IFCNT to verify writes", addr);
     }
 
     motors[addr].configured = true;

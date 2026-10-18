@@ -45,11 +45,11 @@
 // -----------------------------------------------------------------------------
 // Speed & Stepping Parameters (Potentiometer Demo)
 // -----------------------------------------------------------------------------
-#define STEP_PULSE_US          2               // TMC2209 requires min 100ns pulse width
+#define STEP_PULSE_US          5               // 5 us pulse width (matches working script)
 #define POT_DEADBAND_LOW       80              // ADC counts <= this threshold stop the motors
-#define MIN_RUN_SPEED_HZ       150             // Minimum starting step rate in Hz
-#define MAX_SPEED_HZ           8000            // Maximum demo step rate in Hz
-#define TIMER_BASE_INTERVAL_US 50              // 50 us timer tick (20 kHz base rate)
+#define MIN_RUN_SPEED_HZ       100             // 100 Hz starting step rate (matches working script)
+#define MAX_SPEED_HZ           12000           // 12000 Hz max step rate (matches working script)
+#define TIMER_BASE_INTERVAL_US 25              // 25 us base timer tick for smooth up to 12 kHz stepping
 
 static esp_timer_handle_t step_timer = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
@@ -202,17 +202,9 @@ void app_main(void)
     // 4. Scan and configure all 4 driver addresses (0, 1, 2, 3)
     tmc_scan_and_configure_all();
 
-    // 5. Example setup: Configure StallGuard4 & CoolStep on active motors
-    for (uint8_t i = 0; i < TMC_NUM_MOTORS; i++) {
-        if (motors[i].present) {
-            // Set StallGuard sensitivity threshold (e.g., 64)
-            tmc_stallguard_set_threshold(i, 64);
-            // Enable CoolStep automatic current scaling
-            tmc_coolstep_enable(i, 2, 5, 0, 0, false);
-            // Set microsteps to 1/16 with 256 interpolation
-            tmc_set_microsteps(i, 16, true);
-        }
-    }
+    // 5. Motor setup: Drivers are already configured with proven high-torque settings
+    // (4 microsteps, full IRUN=31 current, SpreadCycle, no CoolStep/StallGuard interference)
+    ESP_LOGI(TAG_MAIN, "Motors configured for high-torque 4-microstep operation (matching verified script)");
 
     // 6. Start the periodic multi-motor pulse generation timer
     esp_timer_create_args_t timer_args = {
@@ -235,7 +227,7 @@ void app_main(void)
         int pot_raw = 0;
         int pot_speed = read_pot_mapped(&pot_raw);
 
-        // Update target speed and check StallGuard for all present motors
+        // Update target speed for all present motors
         for (uint8_t i = 0; i < TMC_NUM_MOTORS; i++) {
             if (motors[i].present) {
                 // Keep motor enabled
@@ -245,17 +237,6 @@ void app_main(void)
                 if (motors[i].motion_mode == MOTION_MODE_STEP_DIR) {
                     tmc_set_motor_speed_hz(i, pot_speed);
                     motors[i].is_stalled = false;
-                }
-
-                // In potentiometer demo mode, monitor StallGuard4 load at operational speeds without killing motor
-                if ((loop_counter % 2) == 0 && pot_speed >= 1500) {
-                    uint16_t sg_val = 0;
-                    if (tmc_stallguard_get_result(i, &sg_val)) {
-                        if (sg_val <= ((uint16_t)motors[i].sg_threshold * 2)) {
-                            ESP_LOGW(TAG_MAIN, "Joint %u high load/contact detected (SG4=%u, threshold=%u)",
-                                     i, sg_val, motors[i].sg_threshold);
-                        }
-                    }
                 }
             } else {
                 // If a driver was missing at boot, attempt periodic retry probe
