@@ -1,0 +1,7 @@
+All Future Updates (100% Wireless over Wi-Fi):
+Connect to Wi-Fi: ESP32-Robot-OTA (password: robotics2026).
+Open http://192.168.4.1 in any browser and upload build/2209_control.bin, or run python scripts/ota_flash.py.All Future Updates (100% Wireless over Wi-Fi):
+
+
+
+python scripts/ota_flash.py build/2209_control.bin --ip 192.168.4.1

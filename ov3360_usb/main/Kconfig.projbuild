@@ -1,0 +1,43 @@
+menu "Wi-Fi & Object Detection Rig Configuration"
+
+    config ESP_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "Kitty"
+        help
+            SSID of the Wi-Fi network the ESP32-S3 should connect to.
+
+    config ESP_WIFI_PASSWORD
+        string "Wi-Fi Password"
+        default "Swartkat"
+        help
+            Password for the Wi-Fi network.
+
+    config ESP_WIFI_MAXIMUM_RETRY
+        int "Maximum Wi-Fi Connect Retries"
+        default 10
+        help
+            Maximum retry attempts before reporting Wi-Fi failure.
+
+    config TCP_SERVER_PORT
+        int "TCP Server Port"
+        default 8888
+        help
+            TCP port for PC client to connect and stream frames.
+
+    config DEFAULT_STAGE_MODE
+        int "Default Stage Mode (1 = Results only, 2 = Echo Frame)"
+        range 1 2
+        default 1
+        help
+            Default operational stage:
+            Stage 1: PC sends JPEG -> ESP32 detects -> ESP32 returns bounding box results.
+            Stage 2: PC sends JPEG -> ESP32 detects -> ESP32 returns bounding box results AND echoes the JPEG frame back.
+
+    config DETECTOR_CONFIDENCE_THRESHOLD
+        int "Object Detection Confidence Threshold (%)"
+        range 1 100
+        default 50
+        help
+            Minimum confidence percentage (0-100) to accept a detected object.
+
+endmenu

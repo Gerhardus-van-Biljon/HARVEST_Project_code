@@ -1,0 +1,14 @@
+{
+  "idf.currentSetup": "D:\\.espressif\\v6.0\\esp-idf",
+  "idf.portWin": "COM3",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {},
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\dev\\Eduvos\\2026 Year 3\\ITPPA3 - Project Python Robotics\\code\\build"
+  ]
+}
