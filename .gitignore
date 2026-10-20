@@ -38,8 +38,15 @@ sdkconfig
 **/components/.idf/
 # For modern ESP-IDF component manager
 managed_components/
+**/managed_components/
 # If ESP-IDF tools are installed/referenced locally to the project
 .espressif/
+**/.espressif/
+
+# Datasets and archives
+**/Strawberry_Dataset/
+**/sample_project/all/
+*.zip
 
 # CMake generated files
 CMakeCache.txt

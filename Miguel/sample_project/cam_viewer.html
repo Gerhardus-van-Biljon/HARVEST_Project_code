@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-S3 Camera Stream over BLE</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+        button:hover { background-color: #0056b3; }
+        #streamView {
+            max-width: 480px; /* Reduced from 640px for a sharper, cleaner display fit */
+            width: 100%;
+            border-radius: 8px;
+            border: 2px solid #333;
+            min-height: 240px;
+            background: #000;
+            object-fit: contain;
+            image-rendering: auto;
+        }
+        #status { margin-top: 15px; color: #aaa; }
+    </style>
+</head>
+<body>
+
+    <h2>ESP32-S3 High-Speed BLE Video Stream</h2>
+    <button id="connectBtn">Connect to ESP32 Camera</button>
+    <img id="streamView" alt="Camera Feed Waiting..." />
+    <div id="status">Status: Disconnected</div>
+
+    <script>
+        const SERVICE_UUID = '12fa3d01-1282-2bbf-ef47-58b459a2712d';
+        const CHAR_UUID    = '12fa3d02-1282-2bbf-ef47-58b459a2712d';
+
+        let frameChunks = [];
+        let currentUrl = null;
+
+        const connectBtn = document.getElementById('connectBtn');
+        const streamView = document.getElementById('streamView');
+        const statusDiv = document.getElementById('status');
+
+        connectBtn.addEventListener('click', async () => {
+            try {
+                statusDiv.innerText = "Status: Searching for BLE device...";
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'ESP32S3_CAM' }],
+                    optionalServices: [SERVICE_UUID]
+                });
+
+                statusDiv.innerText = "Status: Connecting to GATT Server...";
+                const server = await device.gatt.connect();
+
+                statusDiv.innerText = "Status: Getting Primary Service...";
+                const service = await server.getPrimaryService(SERVICE_UUID);
+
+                statusDiv.innerText = "Status: Getting Characteristic...";
+                const characteristic = await service.getCharacteristic(CHAR_UUID);
+
+                await characteristic.startNotifications();
+                characteristic.addEventListener('characteristicvaluechanged', handleChunk);
+
+                statusDiv.innerText = "Status: Connected & Receiving Stream";
+            } catch (err) {
+                console.error(err);
+                statusDiv.innerText = "Status: Error - " + err.message;
+            }
+        });
+
+        function handleChunk(event) {
+            const data = new Uint8Array(event.target.value.buffer);
+            if (data.length < 2) return;
+
+            const flag = data[0];
+            const payload = data.subarray(1);
+
+            if (flag === 0x01) { 
+                frameChunks = [payload];
+            } else if (flag === 0x00) { 
+                frameChunks.push(payload);
+            } else if (flag === 0x02) { 
+                frameChunks.push(payload);
+
+                if (frameChunks.length > 0) {
+                    const blob = new Blob(frameChunks, { type: 'image/jpeg' });
+
+                    if (currentUrl) {
+                        URL.revokeObjectURL(currentUrl);
+                    }
+
+                    currentUrl = URL.createObjectURL(blob);
+                    streamView.src = currentUrl;
+                }
+            }
+        }
+    </script>
+</body>
+</html>
