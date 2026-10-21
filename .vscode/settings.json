@@ -10,5 +10,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=d:\\dev\\Eduvos\\2026 Year 3\\ITPPA3 - Project Python Robotics\\code\\build"
-  ]
+  ],
+  "cmake.sourceDirectory": "D:/dev/Eduvos/2026 Year 3/ITPPA3 - Project Python Robotics/code/gerhardus/2209_control"
 }
