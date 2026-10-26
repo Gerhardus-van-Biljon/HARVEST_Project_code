@@ -1,6 +1,7 @@
-/**
- * @file ota_update.c
- * @brief Over-The-Air (OTA) Wireless Firmware Update Implementation for ESP32-S3.
+/*
+ * wireless ota updates over wifi for esp32-s3.
+ * serves an embedded webpage where you can upload the .bin directly,
+ * safely shuts down motor drivers while flashing, and handles partition swapping.
  */
 
 #include "ota_update.h"
@@ -30,9 +31,7 @@ static httpd_handle_t s_http_server = NULL;
 static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap = NULL;
 
-// -----------------------------------------------------------------------------
-// HTML5 & CSS3 Web Portal UI (Embedded Single-Page Application)
-// -----------------------------------------------------------------------------
+// single page web ui embedded directly into the binary
 static const char INDEX_HTML[] = 
 "<!DOCTYPE html>"
 "<html lang='en'>"
@@ -87,7 +86,7 @@ static const char INDEX_HTML[] =
 "</div>"
 "<div class='card'>"
 "<div class='card-title'><span>Upload New Firmware</span></div>"
-"<div class='alert'>⚠️ <strong>Safety Interlock Active:</strong> All 4 motor drivers will be automatically decelerated, halted, and freewheeled during flashing to prevent unexpected mechanical movement.</div>"
+"<div class='alert'>⚠️ <strong>Safety Interlock Active:</strong> All 5 motor drivers will be automatically decelerated, halted, and freewheeled during flashing to prevent unexpected mechanical movement.</div>"
 "<form id='upload-form'>"
 "<div class='drop-zone' id='drop-zone'>"
 "<p style='font-size:1rem;font-weight:500;margin-bottom:6px;'>Drag & Drop <code>2209_control.bin</code> here</p>"
@@ -132,9 +131,7 @@ static const char INDEX_HTML[] =
 "</body>"
 "</html>";
 
-// -----------------------------------------------------------------------------
-// Reboot Helper Task
-// -----------------------------------------------------------------------------
+// helper task to pause briefly so the browser receives the 200 ok before rebooting
 static void reboot_task(void *param)
 {
     vTaskDelay(pdMS_TO_TICKS(1800));
@@ -142,15 +139,14 @@ static void reboot_task(void *param)
     esp_restart();
 }
 
-// -----------------------------------------------------------------------------
-// HTTP Handlers
-// -----------------------------------------------------------------------------
+// serves the main update webpage
 static esp_err_t ota_index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+// json api returning ip, partition name, and free heap
 static esp_err_t ota_status_handler(httpd_req_t *req)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -174,18 +170,19 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
+// receives binary stream from browser upload and writes directly to target ota partition
 static esp_err_t ota_post_update_handler(httpd_req_t *req)
 {
     ESP_LOGW(TAG, "==================================================");
     ESP_LOGW(TAG, "  WIRELESS OTA UPDATE INITIATED OVER HTTP         ");
     ESP_LOGW(TAG, "==================================================");
 
-    // 1. SAFETY INTERLOCK: Halt pulse engine and disable motor coils
+    // safety interlock: halt all motors and drop coils before touching flash
     ESP_LOGI(TAG, "[SAFETY] Stopping all motors & disabling power stages...");
     tmc_stop_all_motors();
     for (int i = 0; i < TMC_NUM_MOTORS; i++) {
         motors[i].target_speed_hz = 0;
-        gpio_set_level(motors[i].en_pin, 1); // Active HIGH = coils unpowered
+        gpio_set_level(motors[i].en_pin, 1); // active high = coils unpowered
     }
 
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
@@ -253,7 +250,7 @@ static esp_err_t ota_post_update_handler(httpd_req_t *req)
 
     free(buf);
 
-    // Finalize and validate SHA256 image checksum
+    // finalize and verify sha256 checksum
     err = esp_ota_end(ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed (%s): Corrupted image or bad checksum!", esp_err_to_name(err));
@@ -276,14 +273,12 @@ static esp_err_t ota_post_update_handler(httpd_req_t *req)
 
     httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"OTA update completed successfully\"}");
 
-    // Spawn non-blocking task to trigger reboot in ~1.8 seconds
+    // reboot after 1.8 seconds so browser gets response cleanly
     xTaskCreate(&reboot_task, "ota_reboot", 2048, NULL, 5, NULL);
     return ESP_OK;
 }
 
-// -----------------------------------------------------------------------------
-// Web Server Startup
-// -----------------------------------------------------------------------------
+// start http server and register route endpoints
 static esp_err_t start_ota_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -334,9 +329,7 @@ static esp_err_t start_ota_webserver(void)
     return ESP_OK;
 }
 
-// -----------------------------------------------------------------------------
-// Wi-Fi Event Handler
-// -----------------------------------------------------------------------------
+// handles connection events for wifi station and access point
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -362,14 +355,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-// -----------------------------------------------------------------------------
-// OTA System Initialization (Station + SoftAP Dual-Mode)
-// -----------------------------------------------------------------------------
+// bring up station + access point dual mode and launch the web server
 esp_err_t ota_system_init(const char *sta_ssid, const char *sta_pass)
 {
     ESP_LOGI(TAG, "Initializing Dual-Mode Wi-Fi & OTA Subsystem...");
 
-    // Record running and next partition names
+    // grab partition labels
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
     if (running) strncpy(s_ota_status.running_partition, running->label, sizeof(s_ota_status.running_partition) - 1);
@@ -381,12 +372,12 @@ esp_err_t ota_system_init(const char *sta_ssid, const char *sta_pass)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // 1. Create SoftAP network interface
+    // 1. set up access point interface
     s_netif_ap = esp_netif_create_default_wifi_ap();
     strncpy(s_ota_status.ap_ip, OTA_AP_STATIC_IP, sizeof(s_ota_status.ap_ip));
     s_ota_status.ap_active = true;
 
-    // 2. Create Station network interface
+    // 2. set up station interface
     s_netif_sta = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -397,7 +388,7 @@ esp_err_t ota_system_init(const char *sta_ssid, const char *sta_pass)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                         &wifi_event_handler, NULL, NULL));
 
-    // Configure SoftAP settings
+    // configure access point
     wifi_config_t ap_config = {
         .ap = {
             .ssid = OTA_DEFAULT_AP_SSID,
@@ -409,7 +400,7 @@ esp_err_t ota_system_init(const char *sta_ssid, const char *sta_pass)
         },
     };
 
-    // Configure Station settings if credentials provided
+    // configure station if credentials were supplied
     wifi_config_t sta_config = {0};
     bool has_sta = false;
     if (sta_ssid != NULL && strlen(sta_ssid) > 0) {
@@ -432,15 +423,13 @@ esp_err_t ota_system_init(const char *sta_ssid, const char *sta_pass)
     ESP_LOGI(TAG, "SoftAP active! SSID: '%s', Password: '%s', IP: http://%s",
              OTA_DEFAULT_AP_SSID, OTA_DEFAULT_AP_PASS, s_ota_status.ap_ip);
 
-    // 3. Start embedded HTTP server
+    // 3. start web server
     start_ota_webserver();
 
     return ESP_OK;
 }
 
-// -----------------------------------------------------------------------------
-// Rollback Protection & App Validation
-// -----------------------------------------------------------------------------
+// mark running app as valid to prevent rollback on next restart
 esp_err_t ota_confirm_app_valid(void)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -454,6 +443,7 @@ esp_err_t ota_confirm_app_valid(void)
     return ESP_OK;
 }
 
+// copy current ota status out
 void ota_get_status(ota_status_t *out_status)
 {
     if (out_status != NULL) {
@@ -461,6 +451,7 @@ void ota_get_status(ota_status_t *out_status)
     }
 }
 
+// dump network info to terminal
 void ota_print_network_info(void)
 {
     printf("\n+--------------------------------------------------------------+\n");
@@ -478,4 +469,3 @@ void ota_print_network_info(void)
     }
     printf("+--------------------------------------------------------------+\n\n");
 }
-

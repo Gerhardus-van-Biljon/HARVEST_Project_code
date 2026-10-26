@@ -1,10 +1,19 @@
-/**
- * @file tmc2209.h
- * @brief TMC2209 Stepper Driver Register Definitions, Protocol, and Multi-Motor Control API.
- * 
- * Supports up to 4 TMC2209 drivers on a shared half-duplex UART bus (addresses 0..3).
- * Provides full control over motion (STEP/DIR & VACTUAL), StallGuard4, CoolStep,
- * current scaling, microstepping, SpreadCycle/StealthChop, diagnostics, and robotics hooks.
+/*
+ * tmc2209.h - register map, configuration, and controls for our 5 TMC2209 drivers
+ *
+ * Project notes:
+ * - 5 joints total on the arm.
+ * - Hardware UART addressing: TMC2209 MS1/MS2 pins only give 4 addresses (0..3).
+ *   So we split across two UART ports on the ESP32-S3:
+ *     * Bus 0 (UART1): Motors 0..3 (addresses 0, 1, 2, 3)
+ *     * Bus 1 (UART2): Motor 4 (address 0)
+ * - Motor types & currents:
+ *     * Motor 0: big 60mm 2A NEMA 17 for the base (run at IRUN=25, ~1.44A RMS)
+ *     * Motors 1..4: 17HS3401S NEMA 17s (run at IRUN=16, ~0.94A RMS to keep them cool)
+ * - StallGuard4 note:
+ *     * Operates in StealthChop mode (spreadcycle_en = false).
+ *     * At standstill back-EMF is 0, so SG_RESULT reads 0 naturally.
+ *       Never flag a stall when the motor is stopped or starting up!
  */
 
 #pragma once
@@ -18,166 +27,172 @@
 extern "C" {
 #endif
 
-// -----------------------------------------------------------------------------
-// Hardware & Protocol Configuration
-// -----------------------------------------------------------------------------
-#define TMC_NUM_MOTORS            4       // Addresses 0, 1, 2, 3
+// 5 joints in total
+#define TMC_NUM_MOTORS            5
 
-// TMC2209 UART Register Addresses
-#define REG_GCONF                 0x00    // Global configuration
-#define REG_GSTAT                 0x01    // Global status flags (reset, drv_err, uv_cp)
-#define REG_IFCNT                 0x02    // Interface transmission counter
-#define REG_SLAVECONF             0x03    // Slave configuration (SENDDELAY)
-#define REG_IOIN                  0x06    // Input pin states (ENN, STEP, DIR, MS1, MS2, VERSION)
-#define REG_IHOLD_IRUN            0x10    // Driver current control (IHOLD, IRUN, IHOLDDELAY)
-#define REG_TPOWERDOWN            0x11    // Standstill power-down delay
-#define REG_TSTEP                 0x12    // Measured time between microsteps (velocity indicator)
-#define REG_TPWMTHRS              0x13    // Upper velocity threshold for StealthChop
-#define REG_TCOOLTHRS             0x14    // Lower velocity threshold for CoolStep & StallGuard
-#define REG_VACTUAL               0x22    // Direct UART velocity control (signed 24-bit)
+// Dual UART bus wiring on ESP32-S3
+// Bus 0 handles Motors 0..3 (Addresses 0..3 via MS1/MS2)
+#define TMC_UART_BUS0             UART_NUM_1
+#define TMC_UART_BUS0_TX_PIN      GPIO_NUM_10     // connects to PDN_UART through 1k resistor
+#define TMC_UART_BUS0_RX_PIN      GPIO_NUM_11     // connects directly to PDN_UART line
+
+// Bus 1 handles Motor 4 (Address 0)
+#define TMC_UART_BUS1             UART_NUM_2
+#define TMC_UART_BUS1_TX_PIN      GPIO_NUM_16     // connects to Motor 4 PDN_UART through 1k resistor
+#define TMC_UART_BUS1_RX_PIN      GPIO_NUM_21     // connects directly to Motor 4 PDN_UART line
+
+// Step/Dir pins for Motor 4 (Motors 0..3 are defined in tmc2209.c)
+#define MOTOR4_STEP_PIN           GPIO_NUM_14
+#define MOTOR4_DIR_PIN            GPIO_NUM_15
+#define MOTOR4_EN_PIN             GPIO_NUM_4      // shared enable pin across all 5 drivers
+
+// TMC2209 UART registers we talk to
+#define REG_GCONF                 0x00    // global config (StealthChop, direction, etc)
+#define REG_GSTAT                 0x01    // reset & error flags
+#define REG_IFCNT                 0x02    // transmission counter (handy to verify writes)
+#define REG_SLAVECONF             0x03    // reply delay config
+#define REG_IOIN                  0x06    // reads live pin states (step, dir, en, etc)
+#define REG_IHOLD_IRUN            0x10    // run current, hold current, and hold delay
+#define REG_TPOWERDOWN            0x11    // delay before dropping down to hold current
+#define REG_TSTEP                 0x12    // measured time between microsteps (velocity)
+#define REG_TPWMTHRS              0x13    // max speed threshold for StealthChop
+#define REG_TCOOLTHRS             0x14    // min speed threshold for CoolStep and StallGuard
+#define REG_VACTUAL               0x22    // direct UART velocity mode (driver steps itself)
 #define REG_SGTHRS                0x40    // StallGuard4 sensitivity threshold (0..255)
-#define REG_SG_RESULT             0x41    // StallGuard4 result value (0..510 load indicator)
-#define REG_COOLCONF              0x42    // CoolStep smart energy configuration
-#define REG_CHOPCONF              0x6C    // Chopper configuration & microstep resolution (MRES)
-#define REG_DRV_STATUS            0x6F    // Driver status & diagnostic flags
-#define REG_PWMCONF               0x70    // StealthChop PWM configuration & freewheeling mode
-#define REG_PWM_SCALE             0x71    // Actual PWM scale
-#define REG_PWM_AUTO              0x72    // Automatically determined PWM values
+#define REG_SG_RESULT             0x41    // StallGuard4 live mechanical load reading (0..510)
+#define REG_COOLCONF              0x42    // CoolStep current saving settings
+#define REG_CHOPCONF              0x6C    // chopper config & microstep resolution (MRES)
+#define REG_DRV_STATUS            0x6F    // driver status flags (standstill, overtemp, shorts)
+#define REG_PWMCONF               0x70    // StealthChop tuning and freewheel settings
+#define REG_PWM_SCALE             0x71    // live PWM scaling
+#define REG_PWM_AUTO              0x72    // auto-tuned PWM values
 
-// Microstep Resolutions (MRES in CHOPCONF)
-#define TMC_MRES_256              0       // Native 256 microsteps
+// microstep resolution settings in CHOPCONF
+#define TMC_MRES_256              0       // 256 microsteps
 #define TMC_MRES_128              1       // 128 microsteps
 #define TMC_MRES_64               2       // 64 microsteps
 #define TMC_MRES_32               3       // 32 microsteps
 #define TMC_MRES_16               4       // 16 microsteps
 #define TMC_MRES_8                5       // 8 microsteps
 #define TMC_MRES_4                6       // 4 microsteps
-#define TMC_MRES_2                7       // 2 microsteps (halfstep)
-#define TMC_MRES_1                8       // Fullstep
+#define TMC_MRES_2                7       // half-step
+#define TMC_MRES_1                8       // full-step
 
-// Standstill Freewheeling Modes (PWMCONF bits 14..15)
-#define TMC_FREEWHEEL_NORMAL      0       // Normal operation (standstill current IHOLD)
-#define TMC_FREEWHEEL_COIL_OFF    1       // Passive free-wheeling (coils unpowered)
-#define TMC_FREEWHEEL_SHORT_GND   2       // Coils shorted to GND (passive inductive braking)
-#define TMC_FREEWHEEL_SHORT_VS    3       // Coils shorted to VS
+// what to do with motor coils when stopped (PWMCONF bits 14..15)
+#define TMC_FREEWHEEL_NORMAL      0       // normal hold current (IHOLD)
+#define TMC_FREEWHEEL_COIL_OFF    1       // coils totally unpowered (freewheeling)
+#define TMC_FREEWHEEL_SHORT_GND   2       // coils shorted to GND (passive brake)
+#define TMC_FREEWHEEL_SHORT_VS    3       // coils shorted to VS
 
-// Motion Modes
+// motion control modes
 typedef enum {
-    MOTION_MODE_STEP_DIR = 0,             // Pulsed hardware STEP / DIR control
-    MOTION_MODE_UART_VACTUAL = 1          // Direct UART internal velocity generator
+    MOTION_MODE_STEP_DIR = 0,             // hardware STEP/DIR pulses from ESP32 timer
+    MOTION_MODE_UART_VACTUAL = 1          // autonomous velocity mode inside driver chip
 } tmc_motion_mode_t;
 
-// -----------------------------------------------------------------------------
-// Driver Diagnostics Telemetry Structure
-// -----------------------------------------------------------------------------
+// diagnostic telemetry decoded from DRV_STATUS
 typedef struct {
-    uint8_t  addr;                        // Driver address (0..3)
-    bool     otpw;                        // Overtemperature pre-warning
-    bool     ot;                          // Overtemperature shutdown
-    bool     s2ga;                        // Short-to-ground on Phase A
-    bool     s2gb;                        // Short-to-ground on Phase B
-    bool     ola;                         // Open load on Phase A
-    bool     olb;                         // Open load on Phase B
-    uint8_t  cs_actual;                   // Actual current scale (0..31)
-    bool     stealthchop;                 // StealthChop active indicator
-    bool     standstill;                  // Standstill active indicator
+    uint8_t  addr;                        // driver address
+    bool     otpw;                        // overtemperature warning
+    bool     ot;                          // overtemperature shutdown triggered
+    bool     s2ga;                        // phase A shorted to ground
+    bool     s2gb;                        // phase B shorted to ground
+    bool     ola;                         // phase A open load (disconnected wire?)
+    bool     olb;                         // phase B open load
+    uint8_t  cs_actual;                   // active current scale (0..31)
+    bool     stealthchop;                 // StealthChop currently active
+    bool     standstill;                  // driver detects motor is stopped
     uint16_t stallguard_result;           // StallGuard4 load value (0..510)
-    uint32_t raw_status;                  // Full 32-bit DRV_STATUS register
+    uint32_t raw_status;                  // raw 32-bit DRV_STATUS register
 } tmc_drv_status_t;
 
-// -----------------------------------------------------------------------------
-// Motor Configuration & State Structure
-// -----------------------------------------------------------------------------
+// full state and config for a single motor
 typedef struct {
-    uint8_t           addr;               // Driver address on UART bus (0..3)
-    bool              present;            // Driver detected and responsive on UART
-    bool              configured;         // Initial register configuration completed
-    bool              enabled;            // Driver enabled (EN pin + software TOFF)
+    uint8_t           motor_id;           // global joint index (0..4)
+    uint8_t           bus_id;             // UART bus (0 or 1)
+    int               uart_port;          // UART_NUM_1 or UART_NUM_2
+    uint8_t           uart_addr;          // address on that specific UART bus (0..3)
+    uint8_t           addr;               // legacy alias
+    bool              present;            // did we find this driver on boot?
+    bool              configured;         // registers initialized?
+    bool              enabled;            // motor enabled
     
-    // Hardware GPIO pins
-    gpio_num_t        step_pin;           // Hardware STEP pulse GPIO
-    gpio_num_t        dir_pin;            // Hardware DIR direction GPIO
-    gpio_num_t        en_pin;             // Hardware EN enable GPIO (can be shared)
-    bool              dir_level;          // Hardware DIR pin level (0 or 1)
+    // GPIO pins
+    gpio_num_t        step_pin;           // STEP pulse pin
+    gpio_num_t        dir_pin;            // DIR direction pin
+    gpio_num_t        en_pin;             // EN enable pin (active LOW)
+    bool              dir_level;          // DIR pin level (0 or 1)
     
-    // Motion control state
-    tmc_motion_mode_t motion_mode;        // Hardware STEP/DIR or UART VACTUAL
-    int               target_speed_hz;    // Commanded step frequency in Hz
-    int               current_speed_hz;   // Current active step frequency in Hz
-    int32_t           step_accum_us;      // Microsecond accumulator for multi-motor timer
-    int32_t           vactual_velocity;   // Velocity commanded in VACTUAL mode
+    // motion state
+    tmc_motion_mode_t motion_mode;        // STEP/DIR or UART VACTUAL
+    int               target_speed_hz;    // commanded step rate
+    int               current_speed_hz;   // active step rate (ramped)
+    int32_t           step_accum_us;      // accumulator for timer pulses
+    int32_t           vactual_velocity;   // velocity if running VACTUAL
     
-    // StallGuard4 & Load telemetry
-    uint8_t           sg_threshold;       // StallGuard threshold (SGTHRS: 0..255)
-    uint16_t          last_sg_result;     // Last measured SG_RESULT (0..510)
-    bool              is_stalled;         // Stall detected flag
+    // StallGuard4 settings
+    uint8_t           sg_threshold;       // stall threshold (0..255)
+    uint16_t          last_sg_result;     // last measured SG_RESULT
+    bool              is_stalled;         // stall flag
     
-    // Current & Chopper settings
-    uint8_t           irun;               // Run current (0..31)
-    uint8_t           ihold;              // Standstill current (0..31)
-    uint8_t           iholddelay;         // Delay to standstill current (0..15)
-    uint16_t          microsteps;         // Microstep division (1, 2, 4, 8, 16, 32, 64, 128, 256)
-    bool              reverse_dir;        // Software direction inversion via UART (shaft bit)
-    bool              spreadcycle_en;     // SpreadCycle enabled (true) or StealthChop (false)
+    // current & chopper settings
+    uint8_t           irun;               // run current (0..31)
+    uint8_t           ihold;              // hold current (0..31)
+    uint8_t           iholddelay;         // power-down delay
+    uint16_t          microsteps;         // microstep divider (e.g. 16)
+    bool              reverse_dir;        // flip spin direction via UART
+    bool              spreadcycle_en;     // false = StealthChop, true = SpreadCycle
     
-    // Commanded position & step tracking
-    int64_t           total_commanded_steps; // Cumulative emitted microstep pulses
-    float             commanded_motor_deg;   // Theoretical motor angle from steps
-    float             commanded_output_deg;  // Theoretical 20:1 output angle from steps
-    float             tracking_error_deg;    // Delta between commanded and AS5600 angle
+    // step tracking & position comparison with AS5600
+    int64_t           total_commanded_steps; // total pulses sent
+    float             commanded_motor_deg;   // theoretical motor degrees from steps
+    float             commanded_output_deg;  // theoretical output degrees after gearbox
+    float             tracking_error_deg;    // difference between commanded and actual output
+    float             tracking_error_motor_deg; // difference directly on the motor shaft
 
-    // Shadow registers for safe read-modify-write operations
+    // shadow copies of registers so we can do bitwise updates safely
     uint32_t          shadow_gconf;
     uint32_t          shadow_chopconf;
     uint32_t          shadow_pwmconf;
 } tmc_motor_t;
 
-// Global array containing configuration & state for all 4 motors
+// global array of all 5 motors
 extern tmc_motor_t motors[TMC_NUM_MOTORS];
 
-// -----------------------------------------------------------------------------
-// Core UART Protocol & Register Access
-// -----------------------------------------------------------------------------
+// low-level UART protocol functions
 void tmc_calc_crc(uint8_t *datagram, uint8_t datagram_length);
+esp_err_t tmc_uart_bus_init(void);
+void tmc_write_reg_bus(int uart_port, uint8_t bus_addr, uint8_t reg, uint32_t value);
+bool tmc_read_reg_bus(int uart_port, uint8_t bus_addr, uint8_t reg, uint32_t *out, bool verbose);
 void tmc_write_reg(uint8_t addr, uint8_t reg, uint32_t value);
 bool tmc_read_reg_ex(uint8_t addr, uint8_t reg, uint32_t *out, bool verbose);
 bool tmc_read_reg(uint8_t addr, uint8_t reg, uint32_t *out);
 
-// -----------------------------------------------------------------------------
-// Multi-Motor Initialization & Bus Discovery
-// -----------------------------------------------------------------------------
+// motor setup & bus discovery
 void tmc_init_motor_structures(void);
 void tmc_init_hardware_pins(void);
 bool tmc_probe_motor(uint8_t addr, bool verbose);
 bool tmc_configure_motor(uint8_t addr);
 void tmc_scan_and_configure_all(void);
 
-// -----------------------------------------------------------------------------
-// StallGuard4 & Sensorless Homing API
-// -----------------------------------------------------------------------------
+// StallGuard4 & sensorless homing
 bool tmc_stallguard_set_threshold(uint8_t addr, uint8_t threshold);
 bool tmc_stallguard_get_result(uint8_t addr, uint16_t *out_result);
 bool tmc_stallguard_enable(uint8_t addr, uint8_t threshold, uint32_t tcoolthrs);
 bool tmc_stallguard_check_stall(uint8_t addr, bool *is_stalled);
 bool tmc_sensorless_homing(uint8_t addr, int32_t homing_velocity, uint8_t sg_threshold);
 
-// -----------------------------------------------------------------------------
-// CoolStep (Smart Energy & Automatic Current Adjustment)
-// -----------------------------------------------------------------------------
+// CoolStep auto current reduction
 bool tmc_coolstep_enable(uint8_t addr, uint8_t semin, uint8_t semax, uint8_t seup, uint8_t sedn, bool seimin);
 bool tmc_coolstep_disable(uint8_t addr);
 
-// -----------------------------------------------------------------------------
-// Current, Microstepping & Chopper Tuning API
-// -----------------------------------------------------------------------------
+// current and microstep tuning
 bool tmc_set_current(uint8_t addr, uint8_t irun, uint8_t ihold, uint8_t iholddelay);
 bool tmc_set_microsteps(uint8_t addr, uint16_t microsteps, bool interpolate);
 bool tmc_set_spreadcycle(uint8_t addr, bool enable_spreadcycle);
 bool tmc_set_stealthchop_pwm_threshold(uint8_t addr, uint32_t tpwmthrs);
 
-// -----------------------------------------------------------------------------
-// Motion & Velocity Control (UART VACTUAL and STEP/DIR)
-// -----------------------------------------------------------------------------
+// motion commands
 bool tmc_set_velocity_vactual(uint8_t addr, int32_t velocity);
 bool tmc_stop_vactual(uint8_t addr);
 void tmc_set_motor_speed_hz(uint8_t addr, int speed_hz);
@@ -188,14 +203,12 @@ bool tmc_set_software_enable(uint8_t addr, bool enable);
 bool tmc_set_freewheel_mode(uint8_t addr, uint8_t mode);
 bool tmc_set_standby_delay(uint8_t addr, uint8_t delay);
 
-// Multi-motor simultaneous controls
+// multi-motor controls
 void tmc_run_all_motors(int speed_hz);
 void tmc_stop_all_motors(void);
 void tmc_emergency_stop_all(void);
 
-// -----------------------------------------------------------------------------
-// Telemetry & Diagnostics API
-// -----------------------------------------------------------------------------
+// telemetry & diagnostics
 bool tmc_get_drv_status(uint8_t addr, tmc_drv_status_t *status);
 bool tmc_get_ioin(uint8_t addr, uint32_t *ioin_val);
 bool tmc_clear_gstat(uint8_t addr);
@@ -204,15 +217,12 @@ void tmc_print_all_motors_status(void);
 bool tmc_get_position_tracking_error(uint8_t addr, float *out_error_deg);
 void tmc_reset_position(uint8_t addr);
 
-// -----------------------------------------------------------------------------
-// Kinematics & Trajectory Hooks (Dummy / Extensible Callbacks)
-// -----------------------------------------------------------------------------
+// robotics trajectory & safety hooks
 void robot_arm_joint_move_dummy(uint8_t joint_id, float target_angle_deg, float speed_deg_s);
-void robot_arm_stream_trajectory_dummy(const float joint_angles[4], const float joint_speeds[4]);
+void robot_arm_stream_trajectory_dummy(const float joint_angles[5], const float joint_speeds[5]);
 void robot_arm_stallguard_event_callback(uint8_t joint_id, uint16_t sg_result);
 void robot_arm_sync_home_all_dummy(void);
 
 #ifdef __cplusplus
 }
 #endif
-

@@ -33,5 +33,5 @@
     "--compile-commands-dir=d:\\dev\\Eduvos\\2026 Year 3\\ITPPA3 - Project Python Robotics\\code\\2209_control\\build"
   ],
   "idf.flashType": "UART",
-  "idf.port": "COM3"
+  "idf.port": "COM14"
 }

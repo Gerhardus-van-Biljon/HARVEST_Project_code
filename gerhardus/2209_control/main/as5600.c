@@ -1,6 +1,11 @@
-/**
- * @file as5600.c
- * @brief AS5600 Magnetic Rotary Encoder & TCA9548A Multiplexer Implementation.
+/*
+ * as5600.c - reading our 5 magnetic encoders through the TCA9548A I2C mux
+ *
+ * Notes for the robot build:
+ * - Magnets are glued to the rear motor shafts (so 1 motor turn = 4096 counts).
+ * - TCA9548A switches between channels 0..4 because every AS5600 has address 0x36.
+ * - Multi-turn unwrapping tracks full continuous turns across the 0 <-> 4095 boundary.
+ * - Gearing (default 20:1) translates motor shaft turns to arm joint output turns.
  */
 
 #include "as5600.h"
@@ -17,18 +22,16 @@
 
 static const char *TAG = "AS5600";
 
-// Global encoder state array
+// state for all 5 encoders on the robot arm
 as5600_encoder_t encoders[AS5600_NUM_ENCODERS];
 
-// I2C Master Bus & Device Handles
+// I2C bus and device handles
 static i2c_master_bus_handle_t s_bus_handle = NULL;
 static i2c_master_dev_handle_t s_tca_handle = NULL;
 static i2c_master_dev_handle_t s_as5600_handle = NULL;
 static int8_t s_active_mux_ch = -1;
 
-// -----------------------------------------------------------------------------
-// I2C Master Bus Initialization (ESP-IDF v6.0 API)
-// -----------------------------------------------------------------------------
+// initialize the I2C master bus using ESP-IDF v6 driver
 esp_err_t as5600_i2c_bus_init(gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t clk_speed_hz)
 {
     if (s_bus_handle != NULL) {
@@ -36,7 +39,7 @@ esp_err_t as5600_i2c_bus_init(gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t c
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Initializing I2C Master Bus on SDA=GPIO%d, SCL=GPIO%d @ %lu Hz",
+    ESP_LOGI(TAG, "Starting I2C bus on SDA=GPIO%d, SCL=GPIO%d @ %lu Hz",
              sda_pin, scl_pin, (unsigned long)clk_speed_hz);
 
     i2c_master_bus_config_t bus_cfg = {
@@ -51,11 +54,11 @@ esp_err_t as5600_i2c_bus_init(gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t c
 
     esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_bus_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create I2C master bus: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to create I2C bus: %s", esp_err_to_name(err));
         return err;
     }
 
-    // 1. Register TCA9548A multiplexer device handle (Address 0x70)
+    // 1. register the TCA9548A multiplexer (address 0x70)
     i2c_device_config_t tca_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = TCA9548A_DEFAULT_ADDR,
@@ -63,11 +66,12 @@ esp_err_t as5600_i2c_bus_init(gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t c
     };
     err = i2c_master_bus_add_device(s_bus_handle, &tca_cfg, &s_tca_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add TCA9548A device: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to add TCA9548A mux: %s", esp_err_to_name(err));
         return err;
     }
 
-    // 2. Register AS5600 encoder device handle (Address 0x36)
+    // 2. register the AS5600 encoder device handle (address 0x36)
+    // we talk to each encoder by first selecting its channel on the mux
     i2c_device_config_t as5600_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = AS5600_I2C_ADDR,
@@ -75,18 +79,16 @@ esp_err_t as5600_i2c_bus_init(gpio_num_t sda_pin, gpio_num_t scl_pin, uint32_t c
     };
     err = i2c_master_bus_add_device(s_bus_handle, &as5600_cfg, &s_as5600_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add AS5600 device: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to add AS5600 device handle: %s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "I2C devices (TCA9548A @ 0x%02X, AS5600 @ 0x%02X) registered successfully",
+    ESP_LOGI(TAG, "I2C devices registered (Mux @ 0x%02X, AS5600 @ 0x%02X)",
              TCA9548A_DEFAULT_ADDR, AS5600_I2C_ADDR);
     return ESP_OK;
 }
 
-// -----------------------------------------------------------------------------
-// TCA9548A Channel Multiplexing
-// -----------------------------------------------------------------------------
+// select which channel on the TCA9548A mux is active (sends bitmask: 1 << channel)
 esp_err_t tca9548a_select_channel(uint8_t channel)
 {
     if (s_tca_handle == NULL) {
@@ -96,7 +98,7 @@ esp_err_t tca9548a_select_channel(uint8_t channel)
         return ESP_ERR_INVALID_ARG;
     }
     if (s_active_mux_ch == (int8_t)channel) {
-        return ESP_OK; // Already selected
+        return ESP_OK; // already on this channel, skip sending command
     }
 
     uint8_t control_byte = (uint8_t)(1u << channel);
@@ -109,6 +111,7 @@ esp_err_t tca9548a_select_channel(uint8_t channel)
     return err;
 }
 
+// turn off all mux channels so no encoder is talking
 esp_err_t tca9548a_disable_all(void)
 {
     if (s_tca_handle == NULL) {
@@ -122,16 +125,14 @@ esp_err_t tca9548a_disable_all(void)
     return err;
 }
 
-// -----------------------------------------------------------------------------
-// Low-Level AS5600 Register Access
-// -----------------------------------------------------------------------------
+// read a single byte from an AS5600 register (switches mux channel first)
 static esp_err_t as5600_read_reg_u8(uint8_t motor_id, uint8_t reg, uint8_t *out_val)
 {
     if (motor_id >= AS5600_NUM_ENCODERS || out_val == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Switch multiplexer channel if configured
+    // switch to this joint's mux channel
     int8_t ch = encoders[motor_id].mux_channel;
     if (ch >= 0) {
         esp_err_t m_err = tca9548a_select_channel((uint8_t)ch);
@@ -142,13 +143,14 @@ static esp_err_t as5600_read_reg_u8(uint8_t motor_id, uint8_t reg, uint8_t *out_
     return i2c_master_transmit_receive(s_as5600_handle, &reg_addr, 1, out_val, 1, AS5600_I2C_TIMEOUT_MS);
 }
 
+// read a 16-bit register pair (AS5600 returns 4 bits in MSB, 8 bits in LSB)
 static esp_err_t as5600_read_reg_u16(uint8_t motor_id, uint8_t reg_msb, uint16_t *out_val)
 {
     if (motor_id >= AS5600_NUM_ENCODERS || out_val == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Switch multiplexer channel if configured
+    // switch to this joint's mux channel
     int8_t ch = encoders[motor_id].mux_channel;
     if (ch >= 0) {
         esp_err_t m_err = tca9548a_select_channel((uint8_t)ch);
@@ -159,20 +161,18 @@ static esp_err_t as5600_read_reg_u16(uint8_t motor_id, uint8_t reg_msb, uint16_t
     uint8_t data[2] = {0, 0};
     esp_err_t err = i2c_master_transmit_receive(s_as5600_handle, &reg_addr, 1, data, 2, AS5600_I2C_TIMEOUT_MS);
     if (err == ESP_OK) {
-        // AS5600 registers are 12-bit: upper 4 bits are in MSB register, lower 8 bits in LSB register
         *out_val = (((uint16_t)(data[0] & 0x0F)) << 8) | (uint16_t)data[1];
     }
     return err;
 }
 
-// -----------------------------------------------------------------------------
-// High-Level AS5600 Reading & Diagnostics
-// -----------------------------------------------------------------------------
+// read the raw 12-bit angle (0..4095)
 esp_err_t as5600_read_raw_angle(uint8_t motor_id, uint16_t *out_raw)
 {
     return as5600_read_reg_u16(motor_id, AS5600_REG_RAW_ANGLE_MSB, out_raw);
 }
 
+// check magnet health flags: presence, too close/far, and AGC level
 esp_err_t as5600_read_diagnostics(uint8_t motor_id, as5600_diag_t *diag)
 {
     if (diag == NULL) return ESP_ERR_INVALID_ARG;
@@ -197,19 +197,17 @@ esp_err_t as5600_read_diagnostics(uint8_t motor_id, as5600_diag_t *diag)
     return ESP_OK;
 }
 
-// -----------------------------------------------------------------------------
-// Multi-Motor Initialization
-// -----------------------------------------------------------------------------
+// scan channels 0..4 on the TCA9548A mux to find and initialize all 5 encoders
 esp_err_t as5600_init_all(void)
 {
-    ESP_LOGI(TAG, "Initializing %d AS5600 Encoders via TCA9548A...", AS5600_NUM_ENCODERS);
+    ESP_LOGI(TAG, "Checking for %d AS5600 encoders through TCA9548A mux...", AS5600_NUM_ENCODERS);
     int detected_count = 0;
 
     for (uint8_t i = 0; i < AS5600_NUM_ENCODERS; i++) {
         encoders[i].motor_id = i;
-        encoders[i].mux_channel = (int8_t)i;                  // Channel 0..3 on TCA9548A
-        encoders[i].gear_ratio = AS5600_DEFAULT_GEAR_RATIO;   // 20:1 reduction
-        encoders[i].invert_direction = true;                  // Gearbox inverts rotation
+        encoders[i].mux_channel = (int8_t)i;                  // map joint 0..4 to mux channel 0..4
+        encoders[i].gear_ratio = AS5600_DEFAULT_GEAR_RATIO;   // default 20:1 gearbox
+        encoders[i].invert_direction = true;                  // gearbox inverts spin direction
         encoders[i].connected = false;
         encoders[i].initialized_pos = false;
         encoders[i].raw_angle = 0;
@@ -227,7 +225,7 @@ esp_err_t as5600_init_all(void)
         encoders[i].prev_ticks_for_vel = 0;
         memset(&encoders[i].diag, 0, sizeof(encoders[i].diag));
 
-        // Attempt initial probe
+        // try reading from this channel
         uint16_t test_raw = 0;
         esp_err_t err = as5600_read_raw_angle(i, &test_raw);
         if (err == ESP_OK) {
@@ -238,25 +236,22 @@ esp_err_t as5600_init_all(void)
             as5600_read_diagnostics(i, &encoders[i].diag);
 
             detected_count++;
-            ESP_LOGI(TAG, "Encoder %u [TCA Ch %d]: ONLINE | Raw=%u | MD=%d | AGC=%u | Mag=%u",
+            ESP_LOGI(TAG, "Encoder %u [TCA Ch %d]: FOUND | Raw=%u | Magnet=%s | AGC=%u",
                      i, i, test_raw,
-                     encoders[i].diag.magnet_detected ? 1 : 0,
-                     encoders[i].diag.agc,
-                     encoders[i].diag.magnitude);
+                     encoders[i].diag.magnet_detected ? "OK" : "NO MAGNET",
+                     encoders[i].diag.agc);
         } else {
-            ESP_LOGW(TAG, "Encoder %u [TCA Ch %d]: NOT DETECTED (%s)",
+            ESP_LOGW(TAG, "Encoder %u [TCA Ch %d]: Not responding (%s)",
                      i, i, esp_err_to_name(err));
         }
     }
 
-    ESP_LOGI(TAG, "AS5600 discovery complete: %d / %d active encoders",
+    ESP_LOGI(TAG, "Encoder scan finished: %d / %d encoders online",
              detected_count, AS5600_NUM_ENCODERS);
     return (detected_count > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-// -----------------------------------------------------------------------------
-// Kinematics Update & Continuous Multi-Turn Unwrapping
-// -----------------------------------------------------------------------------
+// read joint angle, unwrap multi-turn rollover across 0<->4095, and compute kinematics
 esp_err_t as5600_update(uint8_t motor_id)
 {
     if (motor_id >= AS5600_NUM_ENCODERS) {
@@ -273,7 +268,7 @@ esp_err_t as5600_update(uint8_t motor_id)
     enc->connected = true;
     enc->raw_angle = raw_angle;
 
-    // 1. Initial sample baseline
+    // first sample baseline
     if (!enc->initialized_pos) {
         enc->prev_raw_angle = raw_angle;
         enc->total_ticks = 0;
@@ -284,41 +279,40 @@ esp_err_t as5600_update(uint8_t motor_id)
         return ESP_OK;
     }
 
-    // 2. Unwrapped multi-turn tracking across 0 <-> 4095 boundary
+    // unwrapped multi-turn tracking across 0 <-> 4095 boundary
     int32_t diff = (int32_t)raw_angle - (int32_t)enc->prev_raw_angle;
     if (diff > 2048) {
-        // Wrapped backward across zero (e.g. 10 -> 4090)
+        // rolled backwards past 0 (e.g. 5 -> 4090)
         diff -= 4096;
     } else if (diff < -2048) {
-        // Wrapped forward across zero (e.g. 4090 -> 10)
+        // rolled forwards past 4095 (e.g. 4090 -> 5)
         diff += 4096;
     }
 
     enc->total_ticks += diff;
     enc->prev_raw_angle = raw_angle;
 
-    // 3. Compute motor shaft position
+    // motor shaft position (sensors are mounted right on the motor rear shaft)
     int64_t rel_ticks = enc->total_ticks - enc->zero_offset_ticks;
     enc->motor_revs = (float)rel_ticks / AS5600_COUNTS_PER_REV;
     enc->motor_angle_deg = enc->motor_revs * 360.0f;
 
-    // 4. Compute 20:1 gearbox output shaft position
-    // Direction inversion: gearbox reverses rotation
+    // gearbox output position (default 20:1 reduction)
     float dir_sign = enc->invert_direction ? -1.0f : 1.0f;
     enc->output_revs = dir_sign * (enc->motor_revs / enc->gear_ratio);
     enc->output_angle_deg = enc->output_revs * 360.0f;
 
-    // Normalized [0..360) degrees
+    // normalized output angle [0..360)
     float norm_angle = fmodf(enc->output_angle_deg, 360.0f);
     if (norm_angle < 0.0f) {
         norm_angle += 360.0f;
     }
     enc->output_angle_norm = norm_angle;
 
-    // 5. Velocity estimation (RPM & deg/s) with 30ms window
+    // speed estimation over a ~30ms window with simple exponential smoothing
     int64_t now_us = esp_timer_get_time();
     int64_t dt_us = now_us - enc->last_sample_time_us;
-    if (dt_us >= 30000) { // 30 ms
+    if (dt_us >= 30000) {
         float dt_sec = (float)dt_us / 1000000.0f;
         int64_t delta_ticks = enc->total_ticks - enc->prev_ticks_for_vel;
         float d_motor_revs = (float)delta_ticks / AS5600_COUNTS_PER_REV;
@@ -327,7 +321,7 @@ esp_err_t as5600_update(uint8_t motor_id)
         float instant_rpm = (d_output_revs / dt_sec) * 60.0f;
         float instant_deg_s = (d_output_revs * 360.0f) / dt_sec;
 
-        // Exponential smoothing filter for velocity readout
+        // filter to smooth out jumpy speed readouts
         enc->output_rpm = (0.7f * enc->output_rpm) + (0.3f * instant_rpm);
         enc->output_deg_s = (0.7f * enc->output_deg_s) + (0.3f * instant_deg_s);
 
@@ -338,6 +332,7 @@ esp_err_t as5600_update(uint8_t motor_id)
     return ESP_OK;
 }
 
+// read all 5 encoders in sequence through the mux
 esp_err_t as5600_update_all(void)
 {
     esp_err_t last_err = ESP_OK;
@@ -350,23 +345,37 @@ esp_err_t as5600_update_all(void)
     return last_err;
 }
 
-// -----------------------------------------------------------------------------
-// Calibration, Zeroing & Query APIs
-// -----------------------------------------------------------------------------
+// set current joint angle as 0 in software
 void as5600_zero_output_position(uint8_t motor_id)
 {
     if (motor_id < AS5600_NUM_ENCODERS) {
         encoders[motor_id].zero_offset_ticks = encoders[motor_id].total_ticks;
         as5600_update(motor_id);
-        ESP_LOGI(TAG, "Encoder %u output position zeroed at current physical angle", motor_id);
+        ESP_LOGI(TAG, "Zeroed joint %u at current position", motor_id);
     }
 }
 
+// zero out all 5 joints
 void as5600_zero_all(void)
 {
     for (uint8_t i = 0; i < AS5600_NUM_ENCODERS; i++) {
         as5600_zero_output_position(i);
     }
+}
+
+// override gear ratio or invert flag for a specific joint
+void as5600_set_gear_ratio(uint8_t motor_id, float ratio, bool invert)
+{
+    if (motor_id < AS5600_NUM_ENCODERS) {
+        encoders[motor_id].gear_ratio = (ratio > 0.0f) ? ratio : 1.0f;
+        encoders[motor_id].invert_direction = invert;
+    }
+}
+
+// getters for angles and speed
+float as5600_get_motor_angle_deg(uint8_t motor_id)
+{
+    return (motor_id < AS5600_NUM_ENCODERS) ? encoders[motor_id].motor_angle_deg : 0.0f;
 }
 
 float as5600_get_output_angle_deg(uint8_t motor_id)
@@ -394,9 +403,7 @@ float as5600_get_output_rpm(uint8_t motor_id)
     return (motor_id < AS5600_NUM_ENCODERS) ? encoders[motor_id].output_rpm : 0.0f;
 }
 
-// -----------------------------------------------------------------------------
-// Formatted Telemetry Reporting
-// -----------------------------------------------------------------------------
+// print out an ASCII table showing angles, revs, and magnet health for all 5 encoders
 void as5600_print_telemetry(void)
 {
     printf("\n+-----+-----+---------+----------+-----------+------------+------------+-----------+----------+-----+\n");
@@ -411,7 +418,7 @@ void as5600_print_telemetry(void)
             continue;
         }
 
-        // Periodically refresh magnet health
+        // refresh magnet health check
         as5600_read_diagnostics(i, &enc->diag);
 
         const char *mag_str = "GOOD";
@@ -436,4 +443,3 @@ void as5600_print_telemetry(void)
     }
     printf("+-----+-----+---------+----------+-----------+------------+------------+-----------+----------+-----+\n\n");
 }
-

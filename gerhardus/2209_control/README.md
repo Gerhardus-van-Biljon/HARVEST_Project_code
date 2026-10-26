@@ -1,183 +1,137 @@
-# TMC2209 Multi-Motor Stepper Controller (`2209_control`)
+# 2209_control - 5-Axis Stepper & Closed-Loop Encoder Notes
 
-An **ESP-IDF (v6.0)** embedded C firmware project developed for the **ESP32-S3** microcontroller to configure, control, and monitor **up to 4 Trinamic TMC2209** stepper motor drivers simultaneously over a shared half-duplex UART bus.
-
----
-
-## 📌 Project Overview
-
-This project provides real-time multi-axis stepper motion control and UART hardware management for TMC2209 silent stepper motor drivers. It features:
-* **Simultaneous 4-Motor Control**: Addresses `0`, `1`, `2`, and `3` (selected via `MS1` and `MS2` pins on each driver) running concurrently on a single-wire UART bus.
-* **Dual Motion Engines**:
-  * **Hardware STEP/DIR**: Low-jitter periodic multi-motor pulse generation via ESP-IDF high-resolution timer (`esp_timer`).
-  * **Direct UART Velocity (`VACTUAL`)**: Silicon-level autonomous step generation driven over UART commands.
-* **StallGuard4™ & Sensorless Load Telemetry**: Read mechanical load (`SG_RESULT`), configure sensitivity thresholds (`SGTHRS`), and execute sensorless homing.
-* **CoolStep™ Dynamic Current Control**: Automatically reduces energy consumption and motor heating under light loads.
-* **Interactive Speed Regulation**: Potentiometer ADC input mapped dynamically to all active joints.
-* **Extensible Robotics Hooks**: Ready-to-use dummy and callback APIs for inverse kinematics, 4-DOF trajectory streaming, and joint safety interlocks.
+ESP-IDF (v6.0) project for the ESP32-S3 driving a 5-DOF robotic arm. Controls 5 Trinamic TMC2209 stepper drivers and reads 5 AS5600 12-bit magnetic encoders through a TCA9548A I2C multiplexer.
 
 ---
 
-## 🛠 Hardware & Pin Configuration
+### Quick Project Summary
 
-All 4 TMC2209 drivers share the single-wire UART communication lines (half-duplex). Each driver is assigned an individual address via its `MS1` and `MS2` pins.
+* **5 Motors**:
+  * Motor 0: 60mm Bipolar 2A NEMA 17 for the waist/base (`IRUN=25`, ~1.44A RMS).
+  * Motors 1 to 4: 17HS3401S NEMA 17s for the arm joints (`IRUN=16`, ~0.94A RMS).
+* **Dual UART Buses**:
+  * TMC2209 drivers only have 4 unique hardware addresses (`0..3`), so we split them across two separate hardware UART ports:
+    * **Bus 0 (UART1)**: Motors 0, 1, 2, 3 (addresses 0 to 3).
+    * **Bus 1 (UART2)**: Motor 4 (address 0).
+* **Encoders (AS5600)**:
+  * Mounted directly on the **rear motor shafts** (before the 20:1 gear reduction), giving 4,096 counts per motor rev (81,920 counts per joint output turn).
+  * All 5 sensors share address `0x36`, so they run through channels 0 to 4 of a TCA9548A multiplexer.
+* **Movement Engines**:
+  * Step/Dir pulses generated in software using an ESP32 periodic timer (`esp_timer`) running at 50 µs tick resolution with acceleration ramping.
+  * Direct UART velocity mode (`VACTUAL`) for homing and independent axis moves.
+* **Safety & Sensorless Detection**:
+  * StallGuard4 active in StealthChop mode. Stall checks are gated so they don't false-trigger at standstill (where back-EMF is 0).
+* **Web OTA Updates**:
+  * Built-in Wi-Fi access point (`ESP32-Robot-OTA`) with a web page for flashing `.bin` updates directly in a browser.
 
-### TMC2209 Address Selection
-| Motor Index | Device Address | `MS1` Pin | `MS2` Pin | Typical Joint Role |
-| :---: | :---: | :---: | :---: | :---: |
-| **Motor 0** | `0` (`0b00`) | `GND` | `GND` | Base / Waist |
-| **Motor 1** | `1` (`0b01`) | `VIO` (3.3V) | `GND` | Shoulder |
-| **Motor 2** | `2` (`0b10`) | `GND` | `VIO` (3.3V) | Elbow |
-| **Motor 3** | `3` (`0b11`) | `VIO` (3.3V) | `VIO` (3.3V) | Wrist / End-Effector |
+---
 
-### ESP32-S3 GPIO Mapping
-| Function | Motor 0 (Addr 0) | Motor 1 (Addr 1) | Motor 2 (Addr 2) | Motor 3 (Addr 3) |
-| :--- | :--- | :--- | :--- | :--- |
-| **STEP Pin** | `GPIO_NUM_9` | `GPIO_NUM_5` | `GPIO_NUM_7` | `GPIO_NUM_12` |
-| **DIR Pin** | `GPIO_NUM_2` | `GPIO_NUM_6` | `GPIO_NUM_8` | `GPIO_NUM_13` |
-| **EN Pin** | `GPIO_NUM_4` *(Shared or dedicated)* | `GPIO_NUM_4` | `GPIO_NUM_4` | `GPIO_NUM_4` |
+### Hardware Pinout & Wiring
 
-| Peripheral | ESP32-S3 GPIO | Description |
+#### Motor Addresses & UART Bus Setup
+Addresses are configured with jumpers on `MS1` and `MS2`:
+
+| Joint / Motor | Hardware Role | Motor Model | Bus | Address | MS1 | MS2 | Run Current (IRUN) |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **Motor 0** | Base / Waist | 60mm 2.0A NEMA 17 | Bus 0 (UART1) | 0 | GND | GND | 25 (~1.44A RMS) |
+| **Motor 1** | Shoulder | 17HS3401S NEMA 17 | Bus 0 (UART1) | 1 | 3.3V | GND | 16 (~0.94A RMS) |
+| **Motor 2** | Elbow | 17HS3401S NEMA 17 | Bus 0 (UART1) | 2 | GND | 3.3V | 16 (~0.94A RMS) |
+| **Motor 3** | Wrist Pitch | 17HS3401S NEMA 17 | Bus 0 (UART1) | 3 | 3.3V | 3.3V | 16 (~0.94A RMS) |
+| **Motor 4** | Wrist Roll | 17HS3401S NEMA 17 | Bus 1 (UART2) | 0 | GND | GND | 16 (~0.94A RMS) |
+
+#### ESP32-S3 Pin Mapping
+* **Enable (EN)**: `GPIO 4` (Shared across all 5 drivers, active LOW).
+* **Speed Potentiometer**: `GPIO 1` (ADC1 Channel 0, includes internal pull-down and 5% deadband).
+
+| Motor | STEP Pin | DIR Pin |
 | :--- | :--- | :--- |
-| **UART TX** | `GPIO_NUM_10` | Connected to TMC2209 `PDN_UART` bus (with 1kΩ series resistor) |
-| **UART RX** | `GPIO_NUM_11` | Connected to TMC2209 `PDN_UART` bus |
-| **POT** | `GPIO_NUM_1` | Analog potentiometer input (`ADC_UNIT_1`, `ADC_CHANNEL_0`) |
-| **I2C SDA** | `GPIO_NUM_17` | Connected to TCA9548A `SDA` input pin |
-| **I2C SCL** | `GPIO_NUM_18` | Connected to TCA9548A `SCL` input pin |
+| **Motor 0** | GPIO 9 | GPIO 2 |
+| **Motor 1** | GPIO 5 | GPIO 6 |
+| **Motor 2** | GPIO 7 | GPIO 8 |
+| **Motor 3** | GPIO 12 | GPIO 13 |
+| **Motor 4** | GPIO 14 | GPIO 15 |
 
-### TCA9548A I2C Multiplexer & AS5600 Encoder Mapping
-| Motor / Joint | TCA9548A Channel | AS5600 Address | Gear Ratio | Output Direction | Total Counts / Output Turn |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| **Motor 0 (Base)** | `Channel 0` | `0x36` | `20:1` | Inverted | 81,920 counts ($0.00439^\circ/\text{count}$) |
-| **Motor 1 (Shoulder)**| `Channel 1` | `0x36` | `20:1` | Inverted | 81,920 counts ($0.00439^\circ/\text{count}$) |
-| **Motor 2 (Elbow)** | `Channel 2` | `0x36` | `20:1` | Inverted | 81,920 counts ($0.00439^\circ/\text{count}$) |
-| **Motor 3 (Wrist)** | `Channel 3` | `0x36` | `20:1` | Inverted | 81,920 counts ($0.00439^\circ/\text{count}$) |
+* **TMC Bus 0 (UART1)**: TX = `GPIO 10` (through 1kΩ resistor to driver RX), RX = `GPIO 11`.
+* **TMC Bus 1 (UART2)**: TX = `GPIO 16` (through 1kΩ resistor to driver RX), RX = `GPIO 21`.
+* **I2C Multiplexer (TCA9548A)**: SDA = `GPIO 17`, SCL = `GPIO 18` (pull-ups enabled).
 
----
+#### TCA9548A Channels to AS5600 Encoders
+Encoders sit on the motor shafts (4096 counts/rev) feeding 20:1 gearboxes:
 
-## ⚙️ Key Specifications & Parameters
-
-* **Target Microcontroller:** ESP32-S3 (ESP-IDF v6.0)
-* **UART Baud Rate:** 115,200 baud (8-N-1)
-* **Base Step Engine Resolution:** 50 µs tick rate (20 kHz periodic accumulator)
-* **Step Pulse Width:** 2 µs (`STEP_PULSE_US`, exceeds TMC2209 100 ns minimum requirement)
-* **Dynamic Speed Range:** 100 Hz to 12,000 Hz (`MIN_SPEED_HZ` to `MAX_SPEED_HZ`)
-* **ADC Resolution:** 12-bit (0–4095 range) with 12 dB attenuation (`ADC_ATTEN_DB_12`)
+| Motor | TCA9548A Mux Channel | I2C Addr | Gearbox Ratio | Resolution at Output Shaft |
+| :--- | :--- | :---: | :---: | :--- |
+| **Motor 0 (Base)** | Channel 0 | 0x36 | 20:1 | 81,920 counts/rev (~0.0044°/count) |
+| **Motor 1 (Shoulder)** | Channel 1 | 0x36 | 20:1 | 81,920 counts/rev (~0.0044°/count) |
+| **Motor 2 (Elbow)** | Channel 2 | 0x36 | 20:1 | 81,920 counts/rev (~0.0044°/count) |
+| **Motor 3 (Wrist P)** | Channel 3 | 0x36 | 20:1 | 81,920 counts/rev (~0.0044°/count) |
+| **Motor 4 (Wrist R)** | Channel 4 | 0x36 | 20:1 | 81,920 counts/rev (~0.0044°/count) |
 
 ---
 
-## 🧩 Firmware Architecture & Modules
+### Key Software Notes
 
-### 1. Multi-Device Single-Wire UART & CRC8 Protocol ([`tmc2209.c`](file:///d:/dev/Eduvos/2026%20Year%203/ITPPA3%20-%20Project%20Python%20Robotics/code/2209_control/main/tmc2209.c))
-* **CRC8 Calculation (`tmc_calc_crc`)**: Implements Trinamic polynomial $x^8 + x^2 + x^1 + 1$ with seed `0x07`.
-* **Register Write (`tmc_write_reg`)**: 8-byte frames: `0x05` + `ADDR (0..3)` + `REG | 0x80` + 4-byte payload + CRC.
-* **Register Read (`tmc_read_reg_ex`)**: 4-byte query, extracts 8-byte response frame (`0xFF` address filter + CRC validation).
-* **Bus Discovery (`tmc_scan_and_configure_all`)**: Probes all 4 addresses at boot. Automatically initializes detected drivers and provides non-blocking hot-plug re-detection in the main loop.
-
-### 2. StallGuard4™ & Sensorless Homing
-* **Sensitivity Threshold (`tmc_stallguard_set_threshold`)**: Sets `REG_SGTHRS` (0..255). Lower values require higher torque to flag stalls; higher values increase sensitivity.
-* **Real-Time Load Monitoring (`tmc_stallguard_get_result`)**: Reads `REG_SG_RESULT` (0..510). 0 indicates maximum mechanical load / stall condition.
-* **Velocity Gate (`REG_TCOOLTHRS`)**: Enables StallGuard when velocity exceeds threshold (`TSTEP < TCOOLTHRS`).
-* **Sensorless Homing Routine (`tmc_sensorless_homing`)**: Moves joint toward physical hard-stop, detects stall event via StallGuard, and stops motor cleanly.
-
-### 3. CoolStep™ Smart Energy
-* **Dynamic Current Scaling (`tmc_coolstep_enable`)**: Configures `REG_COOLCONF` (`semin`, `semax`, `seup`, `sedn`, `seimin`) to automatically drop motor current by up to 75% during low-torque phases, reducing heat dissipation.
-
-### 4. Direct UART Motion Mode (`VACTUAL`)
-* **Velocity Streaming (`tmc_set_velocity_vactual`)**: Sets `REG_VACTUAL` (signed 24-bit). The driver generates step pulses in internal silicon without requiring CPU step pin pulses.
-* **Mode Restore (`tmc_stop_vactual`)**: Writing 0 restores hardware `STEP`/`DIR` control.
-
-### 5. Multi-Motor Step Pulse Engine
-* Utilizes a periodic ESP-IDF high-resolution timer (`esp_timer_start_periodic` at 50 µs tick).
-* Features microsecond time accumulators per motor, enabling all 4 motors to run at independent or synchronized frequencies without jitter.
-
-### 6. Diagnostics & Telemetry Table
-* Decodes `REG_DRV_STATUS` into human-readable flags:
-  * `STANDSTILL`: Motor stopped
-  * `OTPW` / `OVERTEMP`: Thermal pre-warning & shutdown
-  * `S2GA` / `S2GB`: Short to ground Phase A / B
-  * `OPEN_A` / `OPEN_B`: Open load Phase A / B
-  * `CS`: Active current scale ($0-31$)
-  * `SG4`: Live mechanical load metric ($0-510$)
-
-### 7. Robotics Trajectory & Kinematics Hooks
-* `robot_arm_joint_move_dummy(joint_id, angle_deg, speed_deg_s)`: Maps joint angular velocity into step pulse rate.
-* `robot_arm_stream_trajectory_dummy(...)`: Multi-axis trajectory waypoint executor.
-* `robot_arm_stallguard_event_callback(...)`: Safety interlock that disables a stalled joint when an obstacle is struck.
-* `robot_arm_sync_home_all_dummy(...)`: Coordinated homing sequence for robotic arms.
+* **Trinamic Single-Wire UART**:
+  * Half-duplex communication with an 8-bit CRC polynomial ($x^8 + x^2 + x + 1$, seed `0x07`).
+  * Drivers are automatically scanned on boot. If a driver drops out or is plugged in late, the loop keeps probing every second.
+* **StallGuard4 & Back-EMF Gating**:
+  * StallGuard measures back-EMF in StealthChop mode.
+  * When a motor is stopped or moving very slowly (<400 Hz), back-EMF is naturally near zero, so `SG_RESULT` reads 0. The code gates checks so standstill does not trigger false stall errors.
+* **Timer Step Engine**:
+  * Runs on a 50 µs tick timer.
+  * Accelerates smoothly (+2 Hz per 50 µs tick = ~40,000 Hz/s²) to prevent steppers from losing sync on sudden speed changes.
+* **Encoder Unwrapping**:
+  * AS5600 angle registers (`0x0E`/`0x0F`) are polled over the multiplexer.
+  * Crossings across the 0/4096 boundary are tracked continuously to maintain total revolutions and joint degrees.
+  * Discrepancies between expected step position and encoder angle show up in telemetry as tracking error.
 
 ---
 
-## 📁 Repository Structure
+### Project File Layout
 
 ```text
 2209_control/
-├── .devcontainer/         # Dev container environment settings
-├── .vscode/               # VS Code configuration (ESP-IDF target, OpenOCD, clangd)
-├── main/                  # Application source files
-│   ├── CMakeLists.txt     # IDF component registration (main.c, tmc2209.c, as5600.c, ota_update.c)
-│   ├── ota_update.h       # Dual-mode Wi-Fi & OTA Web Server API definitions
-│   ├── ota_update.c       # Embedded HTTP server, Web Portal UI, flash streaming & safety locks
-│   ├── as5600.h           # AS5600 12-bit encoder & TCA9548A multiplexer API definitions
-│   ├── as5600.c           # I2C driver, 20:1 gearbox kinematics, multi-turn unwrapping
-│   ├── tmc2209.h          # Register definitions, structs & full API prototypes
-│   ├── tmc2209.c          # Multi-driver UART protocol, StallGuard, CoolStep implementation
-│   └── main.c            # Multi-motor coordination, ADC speed input, telemetry loop
+├── main/
+│   ├── main.c           # Speed pot ADC, step timer ISR, main telemetry loop
+│   ├── tmc2209.c        # Dual UART bus driver, CRC8, StallGuard, current setup
+│   ├── tmc2209.h        # Driver registers, structs, and function prototypes
+│   ├── as5600.c         # TCA9548A multiplexer control, angle tracking & unwrap math
+│   ├── as5600.h         # AS5600 registers and encoder structures
+│   ├── ota_update.c     # SoftAP, web portal UI, partition flashing, motor interlock
+│   ├── ota_update.h     # OTA config and network headers
+│   └── CMakeLists.txt   # Main component build sources
 ├── scripts/
-│   └── ota_flash.py       # Python CLI utility for wireless OTA flashing over Wi-Fi
-├── partitions.csv         # 16MB Flash partition table (dual 4MB OTA partitions + 7MB storage)
-├── CMakeLists.txt         # Root ESP-IDF project definition
-├── sdkconfig              # ESP-IDF Kconfig settings (configured for ESP32-S3 N16R8)
-└── README.md              # Project summary & documentation
+│   └── ota_flash.py     # Python script to push updates over Wi-Fi
+├── partitions.csv       # Flash map (two 4MB OTA app partitions)
+├── sdkconfig            # ESP-IDF settings for ESP32-S3 N16R8 (16MB flash)
+└── CMakeLists.txt       # Root project file
 ```
 
 ---
 
-## 🌐 Wireless Over-The-Air (OTA) Firmware Updates
+### Flashing & Working with the Board
 
-The firmware features an integrated **Dual-Mode Wi-Fi Over-The-Air (OTA)** update system with an embedded web management portal and motor safety interlocks.
+#### 1. First-Time Flash (USB Cable)
+Because of the custom partition table (`partitions.csv`), the very first upload must be done over USB so the flash memory gets partitioned:
 
-### 1. Wi-Fi Access Point (SoftAP)
-* **SSID:** `ESP32-Robot-OTA`
-* **Password:** `robotics2026`
-* **Portal URL:** `http://192.168.4.1`
-*(If station router credentials are provided in `ota_system_init()`, the device also connects to your local network and reports its DHCP IP address on the serial console).*
-
-### 2. Browser-Based Wireless Update
-1. Connect your laptop, tablet, or phone to the `ESP32-Robot-OTA` Wi-Fi network.
-2. Open your web browser and navigate to **`http://192.168.4.1`**.
-3. Drag and drop `build/2209_control.bin` into the upload zone (or click to browse).
-4. Click **"Flash Firmware Over-The-Air"**.
-5. The web interface will display live transfer progress.
-6. **Safety Interlock**: During flashing, the pulse generator is halted and motor driver coils are freewheeled to prevent movement.
-7. Upon completion, the ESP32-S3 automatically verifies checksums and reboots into the updated partition!
-
-### 3. Command-Line Wireless Update (CLI)
-You can also flash directly from VS Code or PowerShell without opening a web browser:
 ```powershell
-# Flash wirelessly using the Python utility:
-python scripts/ota_flash.py build/2209_control.bin --ip 192.168.4.1
-
-# Or flash wirelessly using curl:
-curl -X POST --data-binary @build/2209_control.bin http://192.168.4.1/update
-```
-
----
-
-## 🚀 Building and Flashing
-
-### Initial Setup (First Flash over USB)
-Because a new custom partition table (`partitions.csv` for 16MB flash) is introduced, the initial setup must be written **once via USB cable** to partition the physical flash memory:
-```bash
-# 1. Build the firmware
+# Build the project
 idf.py build
 
-# 2. Flash partition table, bootloader, and firmware over USB (e.g. COM4)
+# Flash bootloader, partition table, and app (replace COM4 with your port)
 idf.py -p COM4 flash monitor
 ```
 
-### Subsequent Updates (100% Wireless over Wi-Fi)
-After the initial USB flash, all future firmware iterations can be deployed wirelessly:
-1. Build code: `ninja -C build` (or `idf.py build`).
-2. Upload via Web Portal at `http://192.168.4.1` or via `python scripts/ota_flash.py`.
+#### 2. Wireless Updates (Over Wi-Fi)
+Once the board has the OTA firmware running, you don't need the USB cable anymore:
 
+1. Connect your computer or phone to the Wi-Fi network:
+   * **SSID**: `ESP32-Robot-OTA`
+   * **Password**: `robotics2026`
+2. Open your browser and go to `http://192.168.4.1`.
+3. Drop `build/2209_control.bin` into the page and hit flash.
+4. The ESP32 disables motor power stages while writing flash, verifies the image checksum, and reboots into the new partition.
+
+Alternatively, flash directly from a terminal without opening a browser:
+```powershell
+python scripts/ota_flash.py build/2209_control.bin --ip 192.168.4.1
+```
