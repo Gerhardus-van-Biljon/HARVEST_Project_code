@@ -33,18 +33,18 @@ extern "C" {
 // Dual UART bus wiring on ESP32-S3
 // Bus 0 handles Motors 0..3 (Addresses 0..3 via MS1/MS2)
 #define TMC_UART_BUS0             UART_NUM_1
-#define TMC_UART_BUS0_TX_PIN      GPIO_NUM_10     // connects to PDN_UART through 1k resistor
-#define TMC_UART_BUS0_RX_PIN      GPIO_NUM_11     // connects directly to PDN_UART line
+#define TMC_UART_BUS0_TX_PIN      GPIO_NUM_2      // connects to PDN_UART through 1k resistor
+#define TMC_UART_BUS0_RX_PIN      GPIO_NUM_1      // connects directly to PDN_UART line
 
 // Bus 1 handles Motor 4 (Address 0)
 #define TMC_UART_BUS1             UART_NUM_2
-#define TMC_UART_BUS1_TX_PIN      GPIO_NUM_16     // connects to Motor 4 PDN_UART through 1k resistor
-#define TMC_UART_BUS1_RX_PIN      GPIO_NUM_21     // connects directly to Motor 4 PDN_UART line
+#define TMC_UART_BUS1_TX_PIN      GPIO_NUM_12     // connects to Motor 4 PDN_UART through 1k resistor
+#define TMC_UART_BUS1_RX_PIN      GPIO_NUM_11     // connects directly to Motor 4 PDN_UART line
 
 // Step/Dir pins for Motor 4 (Motors 0..3 are defined in tmc2209.c)
-#define MOTOR4_STEP_PIN           GPIO_NUM_14
-#define MOTOR4_DIR_PIN            GPIO_NUM_15
-#define MOTOR4_EN_PIN             GPIO_NUM_4      // shared enable pin across all 5 drivers
+#define MOTOR4_STEP_PIN           GPIO_NUM_48
+#define MOTOR4_DIR_PIN            GPIO_NUM_47
+#define MOTOR4_EN_PIN             GPIO_NUM_15     // shared enable pin across all 5 drivers
 
 // TMC2209 UART registers we talk to
 #define REG_GCONF                 0x00    // global config (StealthChop, direction, etc)

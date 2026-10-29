@@ -34,25 +34,25 @@ Addresses are configured with jumpers on `MS1` and `MS2`:
 | Joint / Motor | Hardware Role | Motor Model | Bus | Address | MS1 | MS2 | Run Current (IRUN) |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
 | **Motor 0** | Base / Waist | 60mm 2.0A NEMA 17 | Bus 0 (UART1) | 0 | GND | GND | 25 (~1.44A RMS) |
-| **Motor 1** | Shoulder | 17HS3401S NEMA 17 | Bus 0 (UART1) | 1 | 3.3V | GND | 16 (~0.94A RMS) |
-| **Motor 2** | Elbow | 17HS3401S NEMA 17 | Bus 0 (UART1) | 2 | GND | 3.3V | 16 (~0.94A RMS) |
-| **Motor 3** | Wrist Pitch | 17HS3401S NEMA 17 | Bus 0 (UART1) | 3 | 3.3V | 3.3V | 16 (~0.94A RMS) |
+| **Motor 1** | Shoulder | 17HS3401S NEMA 17 | Bus 0 (UART1) | 3 | 3.3V (VIO) | 3.3V (VIO) | 16 (~0.94A RMS) |
+| **Motor 2** | Elbow | 17HS3401S NEMA 17 | Bus 0 (UART1) | 2 | GND | 3.3V (VIO) | 16 (~0.94A RMS) |
+| **Motor 3** | Wrist Pitch | 17HS3401S NEMA 17 | Bus 0 (UART1) | 1 | 3.3V (VIO) | GND | 16 (~0.94A RMS) |
 | **Motor 4** | Wrist Roll | 17HS3401S NEMA 17 | Bus 1 (UART2) | 0 | GND | GND | 16 (~0.94A RMS) |
 
 #### ESP32-S3 Pin Mapping
-* **Enable (EN)**: `GPIO 4` (Shared across all 5 drivers, active LOW).
-* **Speed Potentiometer**: `GPIO 1` (ADC1 Channel 0, includes internal pull-down and 5% deadband).
+* **Enable (EN)**: `GPIO 15` (Shared across all 5 drivers, active LOW).
+* **Speed Potentiometer**: `GPIO 4` (ADC1 Channel 3, includes internal pull-down and 5% deadband).
 
 | Motor | STEP Pin | DIR Pin |
 | :--- | :--- | :--- |
-| **Motor 0** | GPIO 9 | GPIO 2 |
-| **Motor 1** | GPIO 5 | GPIO 6 |
-| **Motor 2** | GPIO 7 | GPIO 8 |
-| **Motor 3** | GPIO 12 | GPIO 13 |
-| **Motor 4** | GPIO 14 | GPIO 15 |
+| **Motor 0** | GPIO 42 | GPIO 41 |
+| **Motor 1** | GPIO 40 | GPIO 39 |
+| **Motor 2** | GPIO 38 | GPIO 37 |
+| **Motor 3** | GPIO 36 | GPIO 35 |
+| **Motor 4** | GPIO 48 | GPIO 47 |
 
-* **TMC Bus 0 (UART1)**: TX = `GPIO 10` (through 1kΩ resistor to driver RX), RX = `GPIO 11`.
-* **TMC Bus 1 (UART2)**: TX = `GPIO 16` (through 1kΩ resistor to driver RX), RX = `GPIO 21`.
+* **TMC Bus 0 (UART1)**: TX = `GPIO 2` (through 1kΩ resistor to driver RX), RX = `GPIO 1`.
+* **TMC Bus 1 (UART2)**: TX = `GPIO 12` (through 1kΩ resistor to driver RX), RX = `GPIO 11`.
 * **I2C Multiplexer (TCA9548A)**: SDA = `GPIO 17`, SCL = `GPIO 18` (pull-ups enabled).
 
 #### TCA9548A Channels to AS5600 Encoders

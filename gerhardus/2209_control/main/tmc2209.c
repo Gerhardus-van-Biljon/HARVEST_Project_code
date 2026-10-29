@@ -20,36 +20,36 @@ static const char *TAG = "TMC2209";
 // uart ports and pin map
 #define TMC_BUS0_PORT       UART_NUM_1
 #define TMC_BUS1_PORT       UART_NUM_2
-#define TMC_BUS0_TX_PIN     GPIO_NUM_10     // goes to driver rx via 1k resistor
-#define TMC_BUS0_RX_PIN     GPIO_NUM_11     // comes from driver tx
-#define TMC_BUS1_TX_PIN     GPIO_NUM_16     // goes to motor 4 rx via 1k resistor
-#define TMC_BUS1_RX_PIN     GPIO_NUM_21     // comes from motor 4 tx
+#define TMC_BUS0_TX_PIN     GPIO_NUM_2      // goes to driver rx via 1k resistor
+#define TMC_BUS0_RX_PIN     GPIO_NUM_1      // comes from driver tx
+#define TMC_BUS1_TX_PIN     GPIO_NUM_12     // goes to motor 4 rx via 1k resistor
+#define TMC_BUS1_RX_PIN     GPIO_NUM_11     // comes from motor 4 tx
 
 // pin assignments for the 5 motors on esp32-s3
 // motor 0: address 0 (ms1=gnd, ms2=gnd)
-#define MOTOR0_STEP_PIN   GPIO_NUM_9
-#define MOTOR0_DIR_PIN    GPIO_NUM_2
-#define MOTOR0_EN_PIN     GPIO_NUM_4
+#define MOTOR0_STEP_PIN   GPIO_NUM_42
+#define MOTOR0_DIR_PIN    GPIO_NUM_41
+#define MOTOR0_EN_PIN     GPIO_NUM_15
 
-// motor 1: address 1 (ms1=vio, ms2=gnd)
-#define MOTOR1_STEP_PIN   GPIO_NUM_5
-#define MOTOR1_DIR_PIN    GPIO_NUM_6
-#define MOTOR1_EN_PIN     GPIO_NUM_4
+// motor 1: address 3 (ms1=vio, ms2=vio)
+#define MOTOR1_STEP_PIN   GPIO_NUM_40
+#define MOTOR1_DIR_PIN    GPIO_NUM_39
+#define MOTOR1_EN_PIN     GPIO_NUM_15
 
 // motor 2: address 2 (ms1=gnd, ms2=vio)
-#define MOTOR2_STEP_PIN   GPIO_NUM_7
-#define MOTOR2_DIR_PIN    GPIO_NUM_8
-#define MOTOR2_EN_PIN     GPIO_NUM_4
+#define MOTOR2_STEP_PIN   GPIO_NUM_38
+#define MOTOR2_DIR_PIN    GPIO_NUM_37
+#define MOTOR2_EN_PIN     GPIO_NUM_15
 
-// motor 3: address 3 (ms1=vio, ms2=vio)
-#define MOTOR3_STEP_PIN   GPIO_NUM_12
-#define MOTOR3_DIR_PIN    GPIO_NUM_13
-#define MOTOR3_EN_PIN     GPIO_NUM_4
+// motor 3: address 1 (ms1=vio, ms2=gnd)
+#define MOTOR3_STEP_PIN   GPIO_NUM_36
+#define MOTOR3_DIR_PIN    GPIO_NUM_35
+#define MOTOR3_EN_PIN     GPIO_NUM_15
 
 // motor 4: separate bus 1, addr 0 (ms1=gnd, ms2=gnd)
-#define MOTOR4_STEP_PIN   GPIO_NUM_14
-#define MOTOR4_DIR_PIN    GPIO_NUM_15
-#define MOTOR4_EN_PIN     GPIO_NUM_4
+#define MOTOR4_STEP_PIN   GPIO_NUM_48
+#define MOTOR4_DIR_PIN    GPIO_NUM_47
+#define MOTOR4_EN_PIN     GPIO_NUM_15
 
 // global state array for our 5 motors
 tmc_motor_t motors[TMC_NUM_MOTORS];
@@ -213,12 +213,12 @@ void tmc_init_motor_structures(void)
     motors[0].irun      = 25;                  // ~1.44A RMS / 2.03A peak for 2.0A motor
     motors[0].ihold     = 12;                  // ~0.72A RMS holding current
 
-    // motor 1: bus 0, addr 1 (ms1=vio, ms2=gnd)
+    // motor 1: bus 0, addr 3 (ms1=vio, ms2=vio)
     // 17HS3401S nema 17 (1.3A peak / 0.92A RMS rated)
     motors[1].motor_id  = 1;
     motors[1].bus_id    = 0;
     motors[1].uart_port = TMC_BUS0_PORT;
-    motors[1].uart_addr = 1;
+    motors[1].uart_addr = 3;
     motors[1].addr      = 1;
     motors[1].step_pin  = MOTOR1_STEP_PIN;
     motors[1].dir_pin   = MOTOR1_DIR_PIN;
@@ -239,12 +239,12 @@ void tmc_init_motor_structures(void)
     motors[2].irun      = 16;
     motors[2].ihold     = 8;
 
-    // motor 3: bus 0, addr 3 (ms1=vio, ms2=vio)
+    // motor 3: bus 0, addr 1 (ms1=vio, ms2=gnd)
     // 17HS3401S nema 17
     motors[3].motor_id  = 3;
     motors[3].bus_id    = 0;
     motors[3].uart_port = TMC_BUS0_PORT;
-    motors[3].uart_addr = 3;
+    motors[3].uart_addr = 1;
     motors[3].addr      = 3;
     motors[3].step_pin  = MOTOR3_STEP_PIN;
     motors[3].dir_pin   = MOTOR3_DIR_PIN;
@@ -332,7 +332,23 @@ bool tmc_probe_motor(uint8_t addr, bool verbose)
     if (ok) {
         motors[addr].present = true;
     }
-    return ok;
+    if (ok) return true;
+
+    // Motor 4 is isolated on Bus 1: auto-scan addresses 0..3 to find its clone address
+    if (addr == 4) {
+        ESP_LOGI(TAG, "Motor 4 did not reply at Addr %u; auto-scanning Bus 1 (addresses 0..3)...", motors[4].uart_addr);
+        for (uint8_t trial = 0; trial < 4; trial++) {
+            if (trial == motors[4].uart_addr) continue;
+            if (tmc_read_reg_bus(motors[4].uart_port, trial, REG_IFCNT, &ifcnt, verbose)) {
+                ESP_LOGI(TAG, ">>> Found Motor 4 on Bus 1 at Address %u! Auto-assigned.", trial);
+                motors[4].uart_addr = trial;
+                motors[4].present = true;
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    return false;
 }
 
 // configure registers: chopper settings, current limits, stealthchop, stallguard thresholds

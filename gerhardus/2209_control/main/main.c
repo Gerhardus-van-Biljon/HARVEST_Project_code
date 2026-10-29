@@ -26,7 +26,7 @@
 #define TAG_MAIN               "MAIN_APP"
 
 // pot input pin on esp32-s3 adc1
-#define POT_PIN                GPIO_NUM_1      // ADC1_CH0
+#define POT_PIN                GPIO_NUM_4      // ADC1_CH3
 
 // pulse timing and step rate bounds
 #define STEP_PULSE_US          2               // tmc2209 only needs 100ns min, 2us is plenty safe
@@ -53,7 +53,7 @@ static void adc_setup(void)
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten = ADC_ATTEN_DB_12,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &channel_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_3, &channel_cfg));
 }
 
 // read adc and convert to step frequency with deadband at bottom
@@ -61,7 +61,7 @@ static int read_pot_mapped(void)
 {
     int adc_raw = 0;
     if (adc_handle != NULL) {
-        adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &adc_raw);
+        adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &adc_raw);
     }
 
     // bottom 5% deadband so motor is dead stopped when turned all the way down
